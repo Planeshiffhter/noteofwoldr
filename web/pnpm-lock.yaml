@@ -314,8 +314,8 @@ importers:
         specifier: ^4.4.0
         version: 4.4.0
       '@patternfly/patternfly':
-        specifier: ^4.224.5
-        version: 4.224.5
+        specifier: ^6.7.0
+        version: 6.7.0
       '@patternfly/pfe-core':
         specifier: ^6.0.0
         version: 6.0.0
@@ -2080,8 +2080,8 @@ packages:
   '@patternfly/icons@1.0.3':
     resolution: {integrity: sha512-8BARaCFBUZU2/TxuOQb8R2/VIpxGMnFwdw5ddT1AMnR2KSifdo+d05SgZtVmFkOIAOA0oCo/YKRgSORDA47wig==}
 
-  '@patternfly/patternfly@4.224.5':
-    resolution: {integrity: sha512-io0huj+LCP5FgDZJDaLv1snxktTYs8iCFz/W1VDRneYoebNHLmGfQdF7Yn8bS6PF7qmN6oJKEBlq3AjmmE8vdA==}
+  '@patternfly/patternfly@6.7.0':
+    resolution: {integrity: sha512-jV7bPxypppPtZA1XaJOz/uZsrIy2TA6Av18PLqAbHpZXDtzyHmFUEk3Sl21dQXEJmlMqniOh5Pv/6PHmmamJ9w==}
 
   '@patternfly/pfe-core@5.0.8':
     resolution: {integrity: sha512-gH+gC8+lwLQ5OxcQsmJOSHNHqQgoa+VboM4LlI63N+jnDPmB7E9EZ7VzJc8C4qTPbCIfQp+o1ObjmKyNw/b9TA==}
@@ -6913,7 +6913,7 @@ snapshots:
 
   '@patternfly/icons@1.0.3': {}
 
-  '@patternfly/patternfly@4.224.5': {}
+  '@patternfly/patternfly@6.7.0': {}
 
   '@patternfly/pfe-core@5.0.8':
     dependencies:
