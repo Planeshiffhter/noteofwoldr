@@ -1,0 +1,149 @@
+"""SAML AuthNRequest Parser and dataclass"""
+
+from base64 import b64decode
+from dataclasses import dataclass
+from xml.etree.ElementTree import ParseError  # nosec
+
+from defusedxml import ElementTree
+from django.utils.translation import gettext as _
+from structlog.stdlib import get_logger
+
+from authentik.common.saml.constants import (
+    NS_SAML_PROTOCOL,
+    SAML_NAME_ID_FORMAT_UNSPECIFIED,
+)
+from authentik.common.saml.exceptions import (
+    ERROR_ACS_URL_MISMATCH,
+    ERROR_CANNOT_DECODE_REQUEST,
+    CannotHandleAssertion,
+)
+from authentik.common.saml.parsers.verify import (
+    verify_detached_signature,
+    verify_enveloped_signature,
+)
+from authentik.providers.saml.models import SAMLProvider
+from authentik.providers.saml.utils.encoding import decode_base64_and_inflate
+from authentik.sources.saml.models import SAMLNameIDPolicy
+
+
+@dataclass(slots=True)
+class AuthNRequest:
+    """AuthNRequest Dataclass"""
+
+    id: str | None = None
+
+    relay_state: str | None = None
+
+    name_id_policy: str = SAML_NAME_ID_FORMAT_UNSPECIFIED
+
+    force_authn: bool = False
+
+
+class AuthNRequestParser:
+    """AuthNRequest Parser"""
+
+    provider: SAMLProvider
+
+    def __init__(self, provider: SAMLProvider):
+        self.provider = provider
+        self.logger = get_logger().bind(provider=self.provider)
+
+    def _parse_xml(self, decoded_xml: str | bytes, relay_state: str | None) -> AuthNRequest:
+        try:
+            root = ElementTree.fromstring(decoded_xml)
+        except (ParseError, ValueError) as exc:
+            raise CannotHandleAssertion(ERROR_CANNOT_DECODE_REQUEST, detail=exc) from exc
+        # `ID` is a required attribute of every SAML request (SAML 2.0 core §3.2.1)
+        if "ID" not in root.attrib:
+            raise CannotHandleAssertion(
+                ERROR_CANNOT_DECODE_REQUEST, detail="Request is missing the ID attribute"
+            )
+
+        # http://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+        # `AssertionConsumerServiceURL` can be omitted, and we should fallback to the
+        # default ACS URL
+        if "AssertionConsumerServiceURL" not in root.attrib:
+            request_acs_url = self.provider.acs_url.lower()
+        else:
+            request_acs_url = root.attrib["AssertionConsumerServiceURL"]
+
+        if self.provider.acs_url.lower() != request_acs_url.lower():
+            self.logger.warning(
+                "ACS URL of request doesn't match provider ACS URL",
+                request_acs_url=request_acs_url,
+                provider_acs_url=self.provider.acs_url,
+            )
+            raise CannotHandleAssertion(
+                ERROR_ACS_URL_MISMATCH,
+                detail=_(
+                    "ACS URL of {request_acs_url} doesn't match Provider "
+                    "ACS URL of {provider_acs_url}."
+                ).format(request_acs_url=request_acs_url, provider_acs_url=self.provider.acs_url),
+            )
+
+        # `ForceAuthn` is an optional attribute. When true, the SP requires the IdP to
+        # actively re-authenticate the user instead of relying on an existing session
+        # (SAML 2.0 core §3.4.1).
+        force_authn = root.attrib.get("ForceAuthn", "false").lower() == "true"
+
+        auth_n_request = AuthNRequest(
+            id=root.attrib["ID"], relay_state=relay_state, force_authn=force_authn
+        )
+
+        # Check if AuthnRequest has a NameID Policy object
+        name_id_policies = root.findall(f"{{{NS_SAML_PROTOCOL}}}NameIDPolicy")
+        if len(name_id_policies) > 0:
+            name_id_policy = name_id_policies[0]
+            auth_n_request.name_id_policy = name_id_policy.attrib.get(
+                "Format", SAML_NAME_ID_FORMAT_UNSPECIFIED
+            )
+
+        return auth_n_request
+
+    def parse(self, saml_request: str, relay_state: str | None = None) -> AuthNRequest:
+        """Validate and parse raw request with enveloped signature."""
+        try:
+            decoded_xml = b64decode(saml_request.encode())
+        except ValueError as exc:
+            # covers binascii.Error (invalid base64) and UnicodeDecodeError (not UTF-8)
+            raise CannotHandleAssertion(ERROR_CANNOT_DECODE_REQUEST, detail=exc) from None
+
+        verifier = self.provider.verification_kp
+        if not verifier:
+            return self._parse_xml(decoded_xml, relay_state)
+
+        verify_enveloped_signature(decoded_xml, verifier, "/samlp:AuthnRequest/ds:Signature")
+
+        return self._parse_xml(decoded_xml, relay_state)
+
+    def parse_detached(
+        self,
+        saml_request: str,
+        relay_state: str | None,
+        signature: str | None = None,
+        sig_alg: str | None = None,
+    ) -> AuthNRequest:
+        """Validate and parse raw request with detached signature"""
+        try:
+            decoded_xml = decode_base64_and_inflate(saml_request)
+        except ValueError as exc:
+            # covers binascii.Error (invalid base64) and UnicodeDecodeError (not UTF-8)
+            raise CannotHandleAssertion(ERROR_CANNOT_DECODE_REQUEST, detail=exc) from None
+
+        verifier = self.provider.verification_kp
+        if not verifier:
+            return self._parse_xml(decoded_xml, relay_state)
+
+        verify_detached_signature(
+            "SAMLRequest", saml_request, relay_state, signature, sig_alg, verifier
+        )
+        return self._parse_xml(decoded_xml, relay_state)
+
+    def idp_initiated(self) -> AuthNRequest:
+        """Create IdP Initiated AuthNRequest"""
+        request = AuthNRequest(relay_state=None)
+        if self.provider.default_relay_state != "":
+            request.relay_state = self.provider.default_relay_state
+        if self.provider.default_name_id_policy != SAMLNameIDPolicy.UNSPECIFIED:
+            request.name_id_policy = self.provider.default_name_id_policy
+        return request

@@ -1,0 +1,64 @@
+{
+    "name": "@goauthentik/docs",
+    "version": "0.0.0",
+    "private": true,
+    "license": "MIT",
+    "scripts": {
+        "build": "pnpm --filter \"./docs\" run build",
+        "build:api": "pnpm --filter \"./api\" run build",
+        "build:integrations": "pnpm --filter \"./integrations\" run build",
+        "build:types": "tsc -b",
+        "docusaurus": "docusaurus",
+        "fix": "run-s lint build:types format",
+        "check": "run-s lint:check build:types format:check",
+        "format": "oxfmt --write .",
+        "format:check": "oxfmt --check .",
+        "lint": "oxlint --fix",
+        "lint:check": "oxlint --max-warnings=0",
+        "start": "pnpm --filter \"./docs\" run start",
+        "test": "node --test"
+    },
+    "dependencies": {
+        "@goauthentik/brand-assets": "^2.0.0",
+        "@goauthentik/docusaurus-theme": "workspace:*",
+        "@goauthentik/oxfmt-config": "link:../packages/oxfmt-config",
+        "@goauthentik/oxlint-config": "link:../packages/oxlint-config",
+        "@goauthentik/tsconfig": "link:../packages/tsconfig",
+        "@types/node": "catalog:",
+        "deepmerge-ts": "^8.0.2",
+        "escape-string-regexp": "^5.0.0",
+        "netlify-plugin-cache": "^1.0.3",
+        "netlify-redirect-parser": "^14.4.0",
+        "npm-run-all": "^4.1.5",
+        "oxfmt": "catalog:",
+        "oxlint": "catalog:",
+        "postman-code-generators": "2.1.1",
+        "typescript": "catalog:"
+    },
+    "optionalDependencies": {
+        "@rspack/binding-darwin-arm64": "2.3.3",
+        "@rspack/binding-linux-arm64-gnu": "2.3.3",
+        "@rspack/binding-linux-x64-gnu": "2.3.3",
+        "@swc/core-darwin-arm64": "1.16.22",
+        "@swc/core-linux-arm64-gnu": "1.16.22",
+        "@swc/core-linux-x64-gnu": "1.16.22",
+        "@swc/html-darwin-arm64": "1.16.22",
+        "@swc/html-linux-arm64-gnu": "1.16.22",
+        "@swc/html-linux-x64-gnu": "1.16.22",
+        "lightningcss-darwin-arm64": "1.33.0",
+        "lightningcss-linux-arm64-gnu": "1.33.0",
+        "lightningcss-linux-x64-gnu": "1.33.0"
+    },
+    "devEngines": {
+        "runtime": {
+            "name": "node",
+            "version": "^24.22.3 || >=26.13.1",
+            "onFail": "error"
+        }
+    },
+    "engines": {
+        "node": "^24.22.3 || >=26.13.1",
+        "pnpm": ">=12.4.0"
+    },
+    "packageManager": "pnpm@12.23.0+sha512.02da94ffaf133f46074322afe552f90d40b5f71ae259aefbccdacc5085b1d617e98d65e0131f5748b9b67445978ee5055d7d59a473f1eef0d504854fefcd5975"
+}

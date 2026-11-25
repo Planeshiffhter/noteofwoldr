@@ -1,0 +1,250 @@
+import "./ak-dual-select.js";
+import { AkDualSelect } from "./ak-dual-select.js";
+import { DualSelectEvent } from "./events.js";
+import { type DataProvider, DualSelectEventType, type DualSelectPair } from "./types.js";
+
+import { AKControlElement } from "#elements/ControlElement";
+import { listen } from "#elements/decorators/listen";
+import { toPaginator, PageChangeEvent } from "#elements/Paginator";
+
+import type { Pagination } from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { html, PropertyValues } from "lit";
+import { customElement, property, state } from "lit/decorators.js";
+import { createRef, ref } from "lit/directives/ref.js";
+
+/**
+ * @element ak-dual-select-provider
+ *
+ * A top-level component that understands how the authentik pagination interface works,
+ * and can provide new pages based upon navigation requests.  This is the interface
+ * between authentik and the generic ak-dual-select component; aside from knowing that
+ * the Pagination object "looks like Django," the interior components don't know anything
+ * about authentik at all and could be dropped into Gravity unchanged.)
+ */
+@customElement("ak-dual-select-provider")
+export class AkDualSelectProvider extends AKControlElement<Array<string | number>> {
+    //#region Properties
+
+    /**
+     * A function that takes a page and returns the {@linkcode DualSelectPair DualSelectPair[]}
+     * collection with which to update the "Available" pane.
+     *
+     * @attr
+     */
+    @property({ type: Object })
+    public provider!: DataProvider;
+
+    /**
+     * The list of selected items. This is the *complete* list, not paginated, as presented by a
+     * component with a multi-select list of items to track.
+     *
+     * @attr
+     */
+    @property({ type: Array })
+    public selected: DualSelectPair[] = [];
+
+    /**
+     * The label for the left ("available") pane
+     *
+     * @attr
+     */
+    @property({ attribute: "available-label" })
+    public availableLabel = msg("Available options");
+
+    /**
+     * The label for the right ("selected") pane
+     *
+     * @attr
+     */
+    @property({ attribute: "selected-label" })
+    public selectedLabel = msg("Selected options");
+
+    @property({ type: String })
+    public name: string | null = null;
+
+    /**
+     * When true, the selected pane preserves insertion order instead of sorting alphabetically.
+     *
+     * @attr
+     */
+    @property({ type: Boolean, attribute: "preserve-order" })
+    public preserveOrder = false;
+
+    /**
+     * When true, hides the search bars in both the available and selected panes.
+     *
+     * @attr
+     */
+    @property({ type: Boolean, attribute: "no-search" })
+    public noSearch = false;
+
+    /**
+     * When true, hides the item count status displays in both panes.
+     *
+     * @attr
+     */
+    @property({ type: Boolean, attribute: "no-status" })
+    public noStatus = false;
+
+    /**
+     * The debounce for the search as the user is typing in a request
+     *
+     * @attr
+     */
+    @property({ attribute: "search-delay", type: Number })
+    public searchDelay = 250;
+
+    public get value(): Array<string | number> {
+        return this.dualSelector.value!.selected.map(([k, _]) => k);
+    }
+
+    public toJSON(): Array<string | number> {
+        return this.value;
+    }
+
+    public get pageState() {
+        return this.pagination
+            ? toPaginator(this.pagination)
+            : { itemCount: 0, itemsPerPage: 1, page: 1 };
+    }
+
+    //#endregion
+
+    //#region State
+
+    @state()
+    protected options: DualSelectPair[] = [];
+
+    #loading = false;
+
+    #didFirstUpdate = false;
+    #selected: DualSelectPair[] = [];
+
+    #previousSearchValue = "";
+
+    protected pagination?: Pagination;
+
+    protected abortController: AbortController | null = null;
+
+    //#endregion
+
+    //#region Refs
+
+    protected dualSelector = createRef<AkDualSelect>();
+
+    //#endregion
+
+    //#region Lifecycle
+
+    public override connectedCallback(): void {
+        super.connectedCallback();
+        this.abortController?.abort();
+        this.abortController = new AbortController();
+
+        this.addEventListener(PageChangeEvent.eventName, this.#navigationListener, {
+            signal: this.abortController.signal,
+        });
+
+        this.#fetch(1);
+    }
+
+    public override disconnectedCallback() {
+        super.disconnectedCallback();
+        this.abortController?.abort();
+        this.abortController = null;
+    }
+
+    willUpdate(changedProperties: PropertyValues<this>) {
+        if (changedProperties.has("selected") && !this.#didFirstUpdate) {
+            this.#didFirstUpdate = true;
+            this.#selected = this.selected;
+        }
+
+        if (changedProperties.has("provider")) {
+            this.pagination = undefined;
+            this.#previousSearchValue = "";
+            this.#fetch();
+        }
+    }
+
+    //#endregion
+
+    //#region Private Methods
+
+    #fetch = async (page?: number, search = this.#previousSearchValue): Promise<void> => {
+        if (this.#loading) return;
+
+        this.#previousSearchValue = search;
+        this.#loading = true;
+
+        page ??= this.pagination?.current ?? 1;
+
+        return this.provider(page, search)
+            .then((data) => {
+                this.pagination = data.pagination;
+                this.options = data.options;
+            })
+            .catch((error) => {
+                console.error(error);
+            })
+            .finally(() => {
+                this.#loading = false;
+            });
+    };
+
+    //#endregion
+
+    //#region Event Listeners
+
+    #navigationListener = ({ page }: PageChangeEvent) => {
+        this.#fetch(page, this.#previousSearchValue);
+    };
+
+    @listen(DualSelectEventType.Change)
+    protected changeListener = (event: DualSelectEvent<typeof DualSelectEventType.Change>) => {
+        this.#selected = event.detail.value;
+        this.selected = this.#selected;
+    };
+
+    @listen(DualSelectEventType.Search)
+    protected searchListener = (event: DualSelectEvent<typeof DualSelectEventType.Search>) => {
+        this.#doSearch(event.detail);
+    };
+
+    #searchTimeoutID?: ReturnType<typeof setTimeout>;
+
+    #doSearch = (search: string) => {
+        clearTimeout(this.#searchTimeoutID);
+
+        setTimeout(() => {
+            this.pagination = undefined;
+            this.#fetch(undefined, search);
+        }, this.searchDelay);
+    };
+
+    //#endregion
+
+    render() {
+        return html`<ak-dual-select
+            ${ref(this.dualSelector)}
+            .options=${this.options}
+            .selected=${this.#selected}
+            item-count=${this.pageState.itemCount}
+            items-per-page=${this.pageState.itemsPerPage}
+            page=${this.pageState.page}
+            available-label=${this.availableLabel}
+            selected-label=${this.selectedLabel}
+            ?preserve-order=${this.preserveOrder}
+            ?no-search=${this.noSearch}
+            ?no-status=${this.noStatus}
+        ></ak-dual-select>`;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-dual-select-provider": AkDualSelectProvider;
+    }
+}

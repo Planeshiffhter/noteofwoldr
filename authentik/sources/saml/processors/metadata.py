@@ -1,0 +1,93 @@
+"""SAML Service Provider Metadata Processor"""
+
+from django.http import HttpRequest
+from django.urls import reverse
+from lxml.etree import Element, SubElement, tostring  # nosec
+
+from authentik.common.saml.constants import (
+    ENCRYPTION_METHODS_ADVERTISED,
+    NS_MAP,
+    NS_SAML_METADATA,
+    NS_SIGNATURE,
+    SAML_BINDING_POST,
+)
+from authentik.common.saml.utils import x509_certificate_b64
+from authentik.sources.saml.models import SAMLSource
+
+
+class MetadataProcessor:
+    """SAML Service Provider Metadata Processor"""
+
+    source: SAMLSource
+    http_request: HttpRequest
+
+    def __init__(self, source: SAMLSource, request: HttpRequest):
+        self.source = source
+        self.http_request = request
+
+    # Using type unions doesn't work with cython types (which is what lxml is)
+    def get_signing_key_descriptor(self) -> Element | None:  # noqa: UP007
+        """Get Signing KeyDescriptor, if enabled for the source"""
+        if self.source.signing_kp:
+            key_descriptor = Element(f"{{{NS_SAML_METADATA}}}KeyDescriptor")
+            key_descriptor.attrib["use"] = "signing"
+            key_info = SubElement(key_descriptor, f"{{{NS_SIGNATURE}}}KeyInfo")
+            x509_data = SubElement(key_info, f"{{{NS_SIGNATURE}}}X509Data")
+            x509_certificate = SubElement(x509_data, f"{{{NS_SIGNATURE}}}X509Certificate")
+            x509_certificate.text = x509_certificate_b64(self.source.signing_kp.certificate)
+            return key_descriptor
+        return None
+
+    def get_encryption_key_descriptor(self) -> Element | None:  # noqa: UP007
+        """Get Encryption KeyDescriptor, if enabled for the source"""
+        if self.source.encryption_kp:
+            key_descriptor = Element(f"{{{NS_SAML_METADATA}}}KeyDescriptor")
+            key_descriptor.attrib["use"] = "encryption"
+            key_info = SubElement(key_descriptor, f"{{{NS_SIGNATURE}}}KeyInfo")
+            x509_data = SubElement(key_info, f"{{{NS_SIGNATURE}}}X509Data")
+            x509_certificate = SubElement(x509_data, f"{{{NS_SIGNATURE}}}X509Certificate")
+            x509_certificate.text = x509_certificate_b64(self.source.encryption_kp.certificate)
+            for algorithm in ENCRYPTION_METHODS_ADVERTISED:
+                encryption_method = SubElement(
+                    key_descriptor, f"{{{NS_SAML_METADATA}}}EncryptionMethod"
+                )
+                encryption_method.attrib["Algorithm"] = algorithm
+            return key_descriptor
+        return None
+
+    def get_name_id_format(self) -> Element:
+        element = Element(f"{{{NS_SAML_METADATA}}}NameIDFormat")
+        element.text = self.source.name_id_policy
+        return element
+
+    def build_entity_descriptor(self) -> str:
+        """Build full EntityDescriptor"""
+        entity_descriptor = Element(f"{{{NS_SAML_METADATA}}}EntityDescriptor", nsmap=NS_MAP)
+        entity_descriptor.attrib["entityID"] = self.source.get_issuer(self.http_request)
+
+        sp_sso_descriptor = SubElement(entity_descriptor, f"{{{NS_SAML_METADATA}}}SPSSODescriptor")
+        sp_sso_descriptor.attrib["protocolSupportEnumeration"] = (
+            "urn:oasis:names:tc:SAML:2.0:protocol"
+        )
+
+        signing_descriptor = self.get_signing_key_descriptor()
+        if signing_descriptor is not None:
+            sp_sso_descriptor.append(signing_descriptor)
+
+        encryption_descriptor = self.get_encryption_key_descriptor()
+        if encryption_descriptor is not None:
+            sp_sso_descriptor.append(encryption_descriptor)
+
+        sp_sso_descriptor.append(self.get_name_id_format())
+
+        assertion_consumer_service = SubElement(
+            sp_sso_descriptor, f"{{{NS_SAML_METADATA}}}AssertionConsumerService"
+        )
+        assertion_consumer_service.attrib["isDefault"] = "true"
+        assertion_consumer_service.attrib["index"] = "0"
+        assertion_consumer_service.attrib["Binding"] = SAML_BINDING_POST
+        assertion_consumer_service.attrib["Location"] = self.http_request.build_absolute_uri(
+            reverse("authentik_sources_saml:acs", kwargs={"source_slug": self.source.slug})
+        )
+
+        return tostring(entity_descriptor).decode()

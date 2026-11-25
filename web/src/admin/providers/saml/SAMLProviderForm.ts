@@ -1,0 +1,143 @@
+import { renderForm } from "./SAMLProviderFormForm.js";
+
+import { aki } from "#common/api/client";
+
+import type { SearchSelectChangeEvent } from "#elements/forms/SearchSelect/events";
+
+import { BaseProviderForm } from "#admin/providers/BaseProviderForm";
+
+import {
+    KeyTypeEnum,
+    ProvidersApi,
+    SAMLBindingsEnum,
+    SAMLLogoutMethods,
+    SAMLProvider,
+    CertificateKeyPair,
+} from "@goauthentik/api";
+
+import { customElement, state } from "lit/decorators.js";
+
+@customElement("ak-provider-saml-form")
+export class SAMLProviderFormPage extends BaseProviderForm<SAMLProvider> {
+    @state()
+    protected hasSigningKp = false;
+
+    @state()
+    protected hasEncryptionKp = false;
+
+    @state()
+    protected hasSlsUrl = false;
+
+    @state()
+    protected hasPostBinding = false;
+
+    @state()
+    protected logoutMethod: SAMLLogoutMethods = SAMLLogoutMethods.FrontchannelIframe;
+
+    public override reset(): void {
+        super.reset();
+
+        this.hasSigningKp = false;
+        this.hasEncryptionKp = false;
+        this.hasSlsUrl = false;
+        this.hasPostBinding = false;
+        this.logoutMethod = SAMLLogoutMethods.FrontchannelIframe;
+    }
+
+    @state()
+    protected signingKeyType: KeyTypeEnum | null = null;
+
+    async loadInstance(pk: number): Promise<SAMLProvider> {
+        const provider = await aki(ProvidersApi).providersSamlRetrieve({
+            id: pk,
+        });
+
+        this.hasSigningKp = !!provider.signingKp;
+        this.hasEncryptionKp = !!provider.encryptionKp;
+        this.hasSlsUrl = !!provider.slsUrl;
+        this.hasPostBinding = provider.slsBinding === SAMLBindingsEnum.Post;
+        this.logoutMethod = provider.logoutMethod ?? SAMLLogoutMethods.FrontchannelIframe;
+
+        return provider;
+    }
+
+    async send(data: SAMLProvider): Promise<SAMLProvider> {
+        // If SLS binding is redirect, ensure logout method is not backchannel
+        if (
+            data.slsBinding === SAMLBindingsEnum.Redirect &&
+            data.logoutMethod === SAMLLogoutMethods.Backchannel
+        ) {
+            data.logoutMethod = SAMLLogoutMethods.FrontchannelIframe;
+        }
+
+        if (this.instance) {
+            return aki(ProvidersApi).providersSamlUpdate({
+                id: this.instance.pk,
+                sAMLProviderRequest: data,
+            });
+        }
+
+        return aki(ProvidersApi).providersSamlCreate({
+            sAMLProviderRequest: data,
+        });
+    }
+
+    renderForm() {
+        const setHasSigningKp = ({ detail }: SearchSelectChangeEvent<CertificateKeyPair>) => {
+            this.hasSigningKp = !!detail.value;
+            this.signingKeyType = detail.value?.keyType ?? KeyTypeEnum.Rsa;
+        };
+
+        const setHasEncryptionKp = ({ detail }: SearchSelectChangeEvent<CertificateKeyPair>) => {
+            this.hasEncryptionKp = !!detail.value;
+        };
+
+        const setHasSlsUrl = (ev: Event) => {
+            const akTextInput = ev.currentTarget as HTMLElement & { value?: string };
+
+            if (!akTextInput) return;
+
+            const value = akTextInput.value || "";
+            this.hasSlsUrl = !!value;
+        };
+
+        const setSlsBinding = (ev: Event) => {
+            const target = ev.target as HTMLInputElement;
+            this.hasPostBinding = target.value === SAMLBindingsEnum.Post;
+
+            // If switching to redirect binding, change logout method from backchannel if needed
+            if (
+                target.value === SAMLBindingsEnum.Redirect &&
+                this.logoutMethod === SAMLLogoutMethods.Backchannel
+            ) {
+                this.logoutMethod = SAMLLogoutMethods.FrontchannelIframe;
+            }
+        };
+
+        const setLogoutMethod = (ev: Event) => {
+            const target = ev.target as HTMLInputElement;
+            this.logoutMethod = target.value as SAMLLogoutMethods;
+        };
+
+        return renderForm({
+            provider: this.instance,
+            setHasSigningKp,
+            hasSigningKp: this.hasSigningKp,
+            signingKeyType: this.signingKeyType,
+            setHasEncryptionKp,
+            hasEncryptionKp: this.hasEncryptionKp,
+            setHasSlsUrl,
+            hasSlsUrl: this.hasSlsUrl,
+            setSlsBinding,
+            hasPostBinding: this.hasPostBinding,
+            logoutMethod: this.logoutMethod,
+            setLogoutMethod,
+        });
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-provider-saml-form": SAMLProviderFormPage;
+    }
+}

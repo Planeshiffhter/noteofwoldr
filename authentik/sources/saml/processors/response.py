@@ -1,0 +1,497 @@
+"""authentik saml source processor"""
+
+from base64 import b64decode
+from datetime import UTC, datetime
+from hashlib import sha256
+from time import mktime
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+import xmlsec
+from django.core.cache import cache
+from django.core.exceptions import SuspiciousOperation
+from django.http import HttpRequest
+from django.urls import reverse
+from django.utils.timezone import now
+from lxml import etree  # nosec
+from lxml.etree import _Element  # nosec
+from structlog.stdlib import get_logger
+
+from authentik.common.saml.constants import (
+    NS_MAP,
+    NS_SAML_ASSERTION,
+    NS_SAML_PROTOCOL,
+    SAML_NAME_ID_FORMAT_EMAIL,
+    SAML_NAME_ID_FORMAT_PERSISTENT,
+    SAML_NAME_ID_FORMAT_TRANSIENT,
+    SAML_NAME_ID_FORMAT_UNSPECIFIED,
+    SAML_NAME_ID_FORMAT_WINDOWS,
+    SAML_NAME_ID_FORMAT_X509,
+    SAML_STATUS_SUCCESS,
+)
+from authentik.common.saml.utils import get_element_text
+from authentik.core.models import (
+    USER_ATTRIBUTE_DELETE_ON_LOGOUT,
+    USER_ATTRIBUTE_EXPIRES,
+    USER_ATTRIBUTE_GENERATED,
+    USER_ATTRIBUTE_SOURCES,
+    USERNAME_MAX_LENGTH,
+    User,
+)
+from authentik.core.sources.flow_manager import SourceFlowManager
+from authentik.lib.utils.time import timedelta_from_string
+from authentik.lib.xml import lxml_from_string
+from authentik.sources.saml.exceptions import (
+    InvalidEncryption,
+    InvalidSignature,
+    InvalidTime,
+    MismatchedAudience,
+    MismatchedBinding,
+    MismatchedRequestID,
+    MissingNameID,
+    MissingSAMLResponse,
+    SAMLException,
+    UnsuccessfulStatus,
+    UnsupportedNameIDFormat,
+)
+from authentik.sources.saml.models import (
+    GroupSAMLSourceConnection,
+    SAMLSource,
+    UserSAMLSourceConnection,
+)
+from authentik.sources.saml.processors.request import SESSION_KEY_REQUEST_ID
+
+LOGGER = get_logger()
+if TYPE_CHECKING:
+    from xml.etree.ElementTree import Element  # nosec
+
+# One entry for each Source and assertion
+CACHE_SEEN_ASSERTION_ID = "goauthentik.io/sources/saml/seen_assertion/%s/%s"
+# 24 hours, longer than the validity of most assertions
+CACHE_SEEN_ASSERTION_TIMEOUT = 60 * 60 * 24
+SAML_SUBJECT_CONFIRMATION_METHOD_BEARER = "urn:oasis:names:tc:SAML:2.0:cm:bearer"
+
+
+class ResponseProcessor:
+    """SAML Response Processor"""
+
+    _source: SAMLSource
+
+    _root: _Element
+    _root_xml: bytes
+
+    _http_request: HttpRequest
+
+    _assertion: _Element | None = None
+
+    def __init__(self, source: SAMLSource, request: HttpRequest):
+        self._source = source
+        self._http_request = request
+
+    def parse(self):
+        """Check if `request` contains SAML Response data, parse and validate it."""
+        # First off, check if we have any SAML Data at all.
+        raw_response = self._http_request.POST.get("SAMLResponse", None)
+        if not raw_response:
+            raise MissingSAMLResponse("Request does not contain 'SAMLResponse'")
+        # Check if response is compressed, b64 decode it
+        self._root_xml = b64decode(raw_response.encode())
+        self._root = lxml_from_string(self._root_xml)
+
+        # Verify response signature BEFORE decryption (signature covers encrypted content)
+        if self._source.verification_kp and self._source.signed_response:
+            self._verify_response_signature()
+
+        if self._source.encryption_kp:
+            self._decrypt_response()
+
+        # Verify assertion signature AFTER decryption (signature is inside encrypted content)
+        if self._source.verification_kp and self._source.signed_assertion:
+            self._verify_assertion_signature()
+
+        self._verify_request_id()
+        self._verify_status()
+        self._verify_conditions()
+        self._verify_destination()
+        self._verify_subject_confirmation()
+        self._verify_not_seen_before()
+
+    def _decrypt_response(self):
+        """Decrypt SAMLResponse EncryptedAssertion Element"""
+        manager = xmlsec.KeysManager()
+        key = xmlsec.Key.from_memory(
+            self._source.encryption_kp.key_data,
+            xmlsec.constants.KeyDataFormatPem,
+        )
+
+        manager.add_key(key)
+        encryption_context = xmlsec.EncryptionContext(manager)
+
+        encrypted_assertion = self._root.find(f".//{{{NS_SAML_ASSERTION}}}EncryptedAssertion")
+        if encrypted_assertion is None:
+            raise InvalidEncryption("Response does not contain an EncryptedAssertion element.")
+        # Register Id attributes so a KeyInfo RetrievalMethod referencing a sibling
+        # EncryptedKey by #Id can be resolved by xmlsec
+        xmlsec.tree.add_ids(encrypted_assertion, ["Id"])
+        encrypted_data = xmlsec.tree.find_child(
+            encrypted_assertion, "EncryptedData", xmlsec.constants.EncNs
+        )
+        try:
+            decrypted_assertion = encryption_context.decrypt(encrypted_data)
+        except xmlsec.Error as exc:
+            raise InvalidEncryption(f"Failed to decrypt assertion: {exc}") from exc
+
+        index_of = self._root.index(encrypted_assertion)
+        self._root.remove(encrypted_assertion)
+        self._root.insert(
+            index_of,
+            decrypted_assertion,
+        )
+        self._assertion = decrypted_assertion
+
+    def _verify_conditions(self):
+        conditions = self.get_assertion().find(f"{{{NS_SAML_ASSERTION}}}Conditions")
+        if conditions is None:
+            return
+        _now = now()
+        before = conditions.attrib.get("NotBefore")
+        if before:
+            if datetime.fromisoformat(before).replace(tzinfo=UTC) > _now:
+                raise InvalidTime()
+        on_or_after = conditions.attrib.get("NotOnOrAfter")
+        if on_or_after:
+            if datetime.fromisoformat(on_or_after).replace(tzinfo=UTC) < _now:
+                raise InvalidTime()
+        self._verify_audience(conditions)
+
+    def _verify_audience(self, conditions: _Element):
+        """Verify that our entity ID is listed as an audience of the assertion. Each
+        AudienceRestriction is evaluated independently and must contain a matching Audience."""
+        entity_id = self._source.get_issuer(self._http_request)
+        for restriction in conditions.findall(f"{{{NS_SAML_ASSERTION}}}AudienceRestriction"):
+            audiences = [
+                get_element_text(audience).strip()
+                for audience in restriction.findall(f"{{{NS_SAML_ASSERTION}}}Audience")
+            ]
+            if entity_id not in audiences:
+                LOGGER.warning(
+                    "Assertion audience does not match source entity ID",
+                    entity_id=entity_id,
+                    audiences=audiences,
+                )
+                raise MismatchedAudience()
+
+    def _verify_signature(self, signature_node: _Element, target: _Element):
+        """Verify a single signature node against the given target element."""
+        target_id = target.attrib.get("ID")
+        if not target_id:
+            raise InvalidSignature("Signed element is missing an ID attribute.")
+        refs = signature_node.xpath("./ds:SignedInfo/ds:Reference", namespaces=NS_MAP)
+        if len(refs) != 1:
+            raise InvalidSignature("Signature must contain exactly one Reference.")
+        ref_uri = refs[0].get("URI", "")
+        if ref_uri not in ("", f"#{target_id}"):
+            raise InvalidSignature(
+                "Signature Reference URI does not match the signed element's ID."
+            )
+
+        xmlsec.tree.add_ids(target, ["ID"])
+
+        ctx = xmlsec.SignatureContext()
+        key = xmlsec.Key.from_memory(
+            self._source.verification_kp.certificate_data,
+            xmlsec.constants.KeyDataFormatCertPem,
+        )
+        ctx.key = key
+
+        ctx.set_enabled_key_data([xmlsec.constants.KeyDataX509])
+        try:
+            ctx.verify(signature_node)
+        except xmlsec.Error as exc:
+            raise InvalidSignature(
+                "The signature of the SAML object is either missing or invalid."
+            ) from exc
+        LOGGER.debug("Successfully verified signature")
+
+    def _verify_response_signature(self):
+        """Verify SAML Response's Signature (before decryption)"""
+        signature_nodes = self._root.xpath("/samlp:Response/ds:Signature", namespaces=NS_MAP)
+
+        if len(signature_nodes) != 1:
+            raise InvalidSignature("Expected exactly one Signature in the Response element.")
+
+        self._verify_signature(signature_nodes[0], self._root)
+
+    def _verify_assertion_signature(self):
+        """Verify SAML Assertion's Signature (after decryption)"""
+        signature_nodes = self._root.xpath(
+            "/samlp:Response/saml:Assertion/ds:Signature", namespaces=NS_MAP
+        )
+        if len(signature_nodes) != 1:
+            raise InvalidSignature("Expected exactly one signed Assertion in the Response.")
+        signature_node = signature_nodes[0]
+        assertion = signature_node.getparent()
+
+        self._verify_signature(signature_node, assertion)
+        self._assertion = assertion
+
+    def _verify_request_id(self):
+        if self._source.allow_idp_initiated:
+            return
+        # The Response and the assertion can both name the request that they answer. Read
+        # both, as only the value inside the assertion is covered by the signature. The
+        # value inside the assertion is checked in _verify_subject_confirmation.
+        in_response_to = self._root.attrib.get("InResponseTo")
+        confirmed_ids = [
+            data.attrib.get("InResponseTo") for data in self._get_bearer_confirmation_data()
+        ]
+        if SESSION_KEY_REQUEST_ID not in self._http_request.session or not any(
+            [in_response_to, *confirmed_ids]
+        ):
+            raise MismatchedRequestID(
+                "Missing InResponseTo and IdP-initiated Logins are not allowed"
+            )
+        if in_response_to and in_response_to != self._http_request.session[SESSION_KEY_REQUEST_ID]:
+            raise MismatchedRequestID("Mismatched request ID")
+
+    def _get_bearer_confirmation_data(self) -> list[_Element]:
+        """Get the SubjectConfirmationData of every bearer SubjectConfirmation of the
+        assertion."""
+        assertion = self.get_assertion()
+        if assertion is None:
+            return []
+        confirmations = []
+        for confirmation in assertion.findall(
+            f"{{{NS_SAML_ASSERTION}}}Subject/{{{NS_SAML_ASSERTION}}}SubjectConfirmation"
+        ):
+            method = confirmation.attrib.get("Method")
+            if method is not None and method != SAML_SUBJECT_CONFIRMATION_METHOD_BEARER:
+                continue
+            data = confirmation.find(f"{{{NS_SAML_ASSERTION}}}SubjectConfirmationData")
+            if data is None:
+                continue
+            confirmations.append(data)
+        return confirmations
+
+    def _verify_destination(self):
+        """Verify that the Response names the ACS URL of this Source"""
+        destination = self._root.attrib.get("Destination")
+        if not destination:
+            return
+        acs_url = self._http_request.build_absolute_uri(
+            reverse("authentik_sources_saml:acs", kwargs={"source_slug": self._source.slug})
+        )
+        if destination.lower() != acs_url.lower():
+            LOGGER.warning(
+                "Destination of Response does not match ACS URL",
+                destination=destination,
+                acs_url=acs_url,
+            )
+            raise MismatchedBinding("The Destination does not match the ACS URL of this Source.")
+
+    def _verify_subject_confirmation(self):
+        """One confirmation of the subject must name this Source. An assertion can carry
+        more than one, and satisfying one of them is enough."""
+        first_error = None
+        for data in self._get_bearer_confirmation_data():
+            try:
+                self._check_subject_confirmation(data)
+                return
+            except SAMLException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+        raise MismatchedBinding(
+            "The assertion carries no confirmation of the subject for this Source."
+        )
+
+    def _check_subject_confirmation(self, data: _Element):
+        """Check one SubjectConfirmationData"""
+        recipient = data.attrib.get("Recipient")
+        if recipient:
+            acs_url = self._http_request.build_absolute_uri(
+                reverse("authentik_sources_saml:acs", kwargs={"source_slug": self._source.slug})
+            )
+            if recipient.lower() != acs_url.lower():
+                LOGGER.warning(
+                    "Recipient of assertion does not match ACS URL",
+                    recipient=recipient,
+                    acs_url=acs_url,
+                )
+                raise MismatchedBinding("The Recipient does not match the ACS URL of this Source.")
+        on_or_after = data.attrib.get("NotOnOrAfter")
+        if on_or_after:
+            if datetime.fromisoformat(on_or_after).replace(tzinfo=UTC) < now():
+                raise InvalidTime()
+        in_response_to = data.attrib.get("InResponseTo")
+        if in_response_to and not self._source.allow_idp_initiated:
+            if in_response_to != self._http_request.session.get(SESSION_KEY_REQUEST_ID):
+                raise MismatchedRequestID("Mismatched request ID")
+
+    def _verify_not_seen_before(self):
+        """Verify that the assertion was not used before"""
+        assertion = self.get_assertion()
+        if assertion is None:
+            return
+        assertion_id = assertion.attrib.get("ID")
+        if not assertion_id:
+            LOGGER.warning("Assertion has no ID, cannot check for re-use")
+            return
+        key = CACHE_SEEN_ASSERTION_ID % (
+            self._source.pk,
+            sha256(assertion_id.encode()).hexdigest(),
+        )
+        marker = uuid4().hex
+        cache.add(key, marker, timeout=CACHE_SEEN_ASSERTION_TIMEOUT)
+        if cache.get(key) != marker:
+            raise SuspiciousOperation("Replay attack detected")
+
+    def _verify_status(self):
+        """Check for SAML Status elements"""
+        status = self._root.find(f"{{{NS_SAML_PROTOCOL}}}Status")
+        if status is None:
+            return
+        status_code = status.find(f"{{{NS_SAML_PROTOCOL}}}StatusCode")
+        status_value = status_code.attrib.get("Value") if status_code is not None else None
+        # The second-level StatusCode carries the actual reason (e.g. RequestDenied, AuthnFailed);
+        # the top-level code only says which party is at fault
+        nested_status_code = (
+            status_code.find(f"{{{NS_SAML_PROTOCOL}}}StatusCode")
+            if status_code is not None
+            else None
+        )
+        nested_value = (
+            nested_status_code.attrib.get("Value") if nested_status_code is not None else None
+        )
+        message = status.find(f"{{{NS_SAML_PROTOCOL}}}StatusMessage")
+        message_text = message.text if message is not None else None
+        detail = status.find(f"{{{NS_SAML_PROTOCOL}}}StatusDetail")
+        detail_text = etree.tostring(detail, encoding="unicode") if detail is not None else None
+        if status_value != SAML_STATUS_SUCCESS:
+            LOGGER.warning(
+                "SAML Response has an unsuccessful status",
+                status_code=status_value,
+                nested_status_code=nested_value,
+                message=message_text,
+                detail=detail_text,
+            )
+            parts = [nested_value or status_value or "SAML Status", message_text, detail_text]
+            raise UnsuccessfulStatus(": ".join(part for part in parts if part))
+        if message_text or detail_text:
+            LOGGER.debug("SAML Status message", message=message_text, detail=detail_text)
+
+    def _handle_name_id_transient(self) -> SourceFlowManager:
+        """Handle a NameID with the Format of Transient. This is a bit more complex than other
+        formats, as we need to create a temporary User that is used in the session. This
+        user has an attribute that refers to our Source for cleanup. The user is also deleted
+        on logout and periodically."""
+        # Create a temporary User
+        name_id_el, name_id = self._get_name_id()
+        # trim username to ensure it is max 150 chars
+        username = f"ak-{name_id[: USERNAME_MAX_LENGTH - 14]}-transient"
+        expiry = mktime(
+            (now() + timedelta_from_string(self._source.temporary_user_delete_after)).timetuple()
+        )
+        user: User = User.objects.create(
+            username=username,
+            attributes={
+                USER_ATTRIBUTE_GENERATED: True,
+                USER_ATTRIBUTE_SOURCES: [
+                    self._source.name,
+                ],
+                USER_ATTRIBUTE_DELETE_ON_LOGOUT: True,
+                USER_ATTRIBUTE_EXPIRES: expiry,
+            },
+            path=self._source.get_user_path(),
+        )
+        LOGGER.debug("Created temporary user for NameID Transient", username=name_id)
+        UserSAMLSourceConnection.objects.create(source=self._source, user=user, identifier=name_id)
+        return SAMLSourceFlowManager(
+            source=self._source,
+            request=self._http_request,
+            identifier=str(name_id),
+            user_info={
+                "root": self._root,
+                "assertion": self.get_assertion(),
+                "name_id": name_id_el,
+            },
+            policy_context={},
+        )
+
+    def get_assertion(self) -> Element | None:
+        """Get assertion element, if we have a signed assertion"""
+        if self._assertion is not None:
+            return self._assertion
+        return self._root.find(f"{{{NS_SAML_ASSERTION}}}Assertion")
+
+    def _get_name_id(self) -> tuple[Element, str]:
+        """Get NameID Element"""
+        assertion = self.get_assertion()
+        if assertion is None:
+            raise MissingNameID("Assertion element not found")
+        subject = assertion.find(f"{{{NS_SAML_ASSERTION}}}Subject")
+        if subject is None:
+            raise MissingNameID("Subject element not found")
+        name_id = subject.find(f"{{{NS_SAML_ASSERTION}}}NameID")
+        if name_id is None:
+            raise MissingNameID("NameID element not found")
+        return name_id, get_element_text(name_id)
+
+    def _get_name_id_filter(self) -> dict[str, str]:
+        """Returns the subject's NameID as a Filter for the `User`"""
+        name_id_el, name_id = self._get_name_id()
+        if not name_id:
+            raise UnsupportedNameIDFormat("Subject's NameID is empty.")
+        _format = name_id_el.attrib.get("Format", SAML_NAME_ID_FORMAT_UNSPECIFIED)
+        if _format == SAML_NAME_ID_FORMAT_EMAIL:
+            return {"email": name_id}
+        if _format == SAML_NAME_ID_FORMAT_PERSISTENT:
+            return {"username": name_id}
+        if _format == SAML_NAME_ID_FORMAT_X509:
+            # This attribute is statically set by the LDAP source
+            return {"attributes__distinguishedName": name_id}
+        if _format == SAML_NAME_ID_FORMAT_WINDOWS:
+            if "\\" in name_id:
+                name_id = name_id.split("\\")[1]
+            return {"username": name_id}
+        raise UnsupportedNameIDFormat(
+            f"Assertion contains NameID with unsupported format {_format}."
+        )
+
+    def prepare_flow_manager(self) -> SourceFlowManager:
+        """Prepare flow plan depending on whether or not the user exists"""
+        name_id_el, name_id = self._get_name_id()
+        # The Format attribute is optional, and defaults to unspecified
+        name_id_format = name_id_el.attrib.get("Format", SAML_NAME_ID_FORMAT_UNSPECIFIED)
+        # Sanity check, show a warning if NameIDPolicy doesn't match what we go
+        if self._source.name_id_policy != name_id_format:
+            LOGGER.warning(
+                "NameID from IdP doesn't match our policy",
+                expected=self._source.name_id_policy,
+                got=name_id_format,
+            )
+        # transient NameIDs are handled separately as they don't have to go through flows.
+        if name_id_format == SAML_NAME_ID_FORMAT_TRANSIENT:
+            return self._handle_name_id_transient()
+
+        return SAMLSourceFlowManager(
+            source=self._source,
+            request=self._http_request,
+            identifier=str(name_id),
+            user_info={
+                "root": self._root,
+                "assertion": self.get_assertion(),
+                "name_id": name_id_el,
+            },
+            policy_context={
+                "saml_response": etree.tostring(self._root),
+            },
+        )
+
+
+class SAMLSourceFlowManager(SourceFlowManager):
+    """Source flow manager for SAML Sources"""
+
+    user_connection_type = UserSAMLSourceConnection
+    group_connection_type = GroupSAMLSourceConnection

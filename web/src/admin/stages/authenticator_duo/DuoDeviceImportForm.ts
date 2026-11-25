@@ -1,0 +1,143 @@
+import "#elements/Divider";
+import "#elements/buttons/ActionButton/index";
+import "#elements/forms/HorizontalFormElement";
+import "#components/ak-text-input";
+import { aki } from "#common/api/client";
+import { MessageLevel } from "#common/messages";
+import { plural } from "#common/ui/locale/plurals";
+
+import { ModalForm } from "#elements/forms/ModalForm";
+import { ModelForm } from "#elements/forms/ModelForm";
+import type { SearchSelectSource } from "#elements/forms/SearchSelect/shared";
+import { showMessage } from "#elements/messages/MessageContainer";
+import { SlottedTemplateResult } from "#elements/types";
+
+import { AKSearchSelect } from "#components/ak-search-select-field";
+
+import { userSource } from "#admin/common/search-sources";
+
+import {
+    AuthenticatorDuoStage,
+    AuthenticatorDuoStageManualDeviceImportRequest,
+    StagesApi,
+    User,
+} from "@goauthentik/api";
+
+import { msg, str } from "@lit/localize";
+import { html, nothing } from "lit";
+import { customElement } from "lit/decorators.js";
+
+const usernameSource: SearchSelectSource<User> = {
+    ...userSource,
+    keyOf: (user) => user.username,
+};
+
+@customElement("ak-stage-authenticator-duo-device-import-form")
+export class DuoDeviceImportForm extends ModelForm<AuthenticatorDuoStage, string> {
+    public static override verboseName = msg("Duo Device");
+    public static override verboseNamePlural = msg("Duo Devices");
+    public static override createLabel = msg("Import");
+    public static override submitVerb = msg("Import");
+    public static override modifierLabel = msg("Import");
+    public static override saveLabel = msg("Import");
+    public static override submittingVerb = msg("Importing");
+
+    loadInstance(pk: string): Promise<AuthenticatorDuoStage> {
+        return aki(StagesApi).stagesAuthenticatorDuoRetrieve({
+            stageUuid: pk,
+        });
+    }
+
+    getSuccessMessage(): string {
+        return msg("Successfully imported device.");
+    }
+
+    async send(data: AuthenticatorDuoStage): Promise<void> {
+        const importData = data as unknown as AuthenticatorDuoStageManualDeviceImportRequest;
+
+        return aki(StagesApi).stagesAuthenticatorDuoImportDeviceManualCreate({
+            stageUuid: this.instance?.pk || "",
+            authenticatorDuoStageManualDeviceImportRequest: importData,
+        });
+    }
+
+    protected override renderForm(): SlottedTemplateResult {
+        return html` ${
+            this.instance?.adminIntegrationKey !== "" ? this.renderFormAutomatic() : nothing
+        }
+        ${this.renderFormManual()}`;
+    }
+
+    protected renderFormManual(): SlottedTemplateResult {
+        return html`<ak-form-element-horizontal label=${msg("User")} required name="username">
+                ${AKSearchSelect({
+                    name: "username",
+                    source: usernameSource,
+                    placeholder: msg("Select a user..."),
+                    blankable: false,
+                })}
+
+                <p class="pf-c-form__helper-text">
+                    ${msg("The user in authentik this device will be assigned to.")}
+                </p>
+            </ak-form-element-horizontal>
+            <ak-text-input
+                label=${msg("Duo User ID")}
+                required
+                name="duoUserId"
+                placeholder=${msg("Type the Duo user ID for this device...")}
+                autocomplete="off"
+                input-hint="code"
+                help=${msg("The user ID in Duo, can be found in the URL after clicking on a user.")}
+            >
+            </ak-text-input>`;
+    }
+
+    renderFormAutomatic(): SlottedTemplateResult {
+        return html`<ak-form-element-horizontal label=${msg("Automatic import")}>
+                <ak-action-button
+                    class="pf-m-primary"
+                    .apiRequest=${() => {
+                        return aki(StagesApi)
+                            .stagesAuthenticatorDuoImportDevicesAutomaticCreate({
+                                stageUuid: this.instance?.pk || "",
+                            })
+                            .then((res) => {
+                                showMessage({
+                                    level: MessageLevel.info,
+                                    message: plural(res.count, {
+                                        one: (formattedCount) =>
+                                            msg(
+                                                str`Successfully imported ${formattedCount} device.`,
+                                                {
+                                                    id: "stages.duo.import.success.one",
+                                                },
+                                            ),
+                                        other: (formattedCount) =>
+                                            msg(
+                                                str`Successfully imported ${formattedCount} devices.`,
+                                                {
+                                                    id: "stages.duo.import.success.other",
+                                                },
+                                            ),
+                                    }),
+                                });
+
+                                const modal = this.parentElement as ModalForm;
+                                modal.open = false;
+                            });
+                    }}
+                >
+                    ${msg("Start automatic import")}
+                </ak-action-button>
+            </ak-form-element-horizontal>
+            <ak-divider>${msg("Or manually import")}</ak-divider>
+            <br /> `;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-stage-authenticator-duo-device-import-form": DuoDeviceImportForm;
+    }
+}

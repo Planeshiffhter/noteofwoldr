@@ -1,0 +1,32 @@
+{
+    "$schema": "https://json.schemastore.org/tsconfig",
+    "compilerOptions": {
+        "alwaysStrict": true,
+        "composite": true,
+        "declaration": true,
+        "declarationMap": true,
+        "incremental": true,
+        "isolatedModules": true,
+        "lib": ["ESNext"],
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
+        "newLine": "lf",
+        "noFallthroughCasesInSwitch": true,
+        "noUncheckedIndexedAccess": true,
+        "outDir": "${configDir}/out",
+        "pretty": true,
+        "skipDefaultLibCheck": true,
+        "skipLibCheck": true,
+        "sourceMap": true,
+        "strict": true,
+        "target": "esnext",
+        "useUnknownInCatchVariables": true
+    },
+    "exclude": [
+        "${configDir}/**/out",
+        "${configDir}/**/build",
+        "${configDir}/**/.docusaurus",
+        "${configDir}/**/.netlify",
+        "${configDir}/**/.cache"
+    ]
+}

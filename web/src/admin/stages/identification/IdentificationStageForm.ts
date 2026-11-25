@@ -1,0 +1,298 @@
+import "#components/ak-switch-input";
+import "#components/ak-text-input";
+import "#elements/ak-checkbox-group/ak-checkbox-group";
+import "#elements/ak-dual-select/ak-dual-select-dynamic-selected-provider";
+import "#elements/forms/FormGroup";
+import "#elements/forms/HorizontalFormElement";
+import { sourcesProvider, sourcesSelector } from "./IdentificationStageFormHelpers.js";
+
+import { aki } from "#common/api/client";
+import { groupBy } from "#common/utils";
+
+import { SearchSelectSource, withQuery } from "#elements/forms/SearchSelect/shared";
+
+import { AKLabel } from "#components/ak-label";
+import { AKSearchSelect } from "#components/ak-search-select-field";
+
+import { AKFlowSearch } from "#admin/common/ak-flow-search/AKFlowSearch";
+import { BaseStageForm } from "#admin/stages/BaseStageForm";
+
+import {
+    FlowDesignationEnum,
+    IdentificationStage,
+    Stage,
+    StagesApi,
+    UserFieldsEnum,
+} from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { css, html, TemplateResult } from "lit";
+import { customElement } from "lit/decorators.js";
+
+const groupStages = (stages: Stage[]) => groupBy(stages, (stage) => stage.verboseNamePlural);
+
+const passwordStageSource: SearchSelectSource<Stage> = {
+    fetchObjects: (query) =>
+        aki(StagesApi)
+            .stagesPasswordList(withQuery(query, { ordering: "name" }))
+            .then(({ results }) => results),
+    keyOf: (stage) => stage.pk,
+    labelOf: (stage) => stage.name,
+    groupBy: groupStages,
+};
+
+const captchaStageSource: SearchSelectSource<Stage> = {
+    fetchObjects: (query) =>
+        aki(StagesApi)
+            .stagesCaptchaList(withQuery(query, { ordering: "name" }))
+            .then(({ results }) => results),
+    keyOf: (stage) => stage.pk,
+    labelOf: (stage) => stage.name,
+    groupBy: groupStages,
+};
+
+const authenticatorValidateStageSource: SearchSelectSource<Stage> = {
+    fetchObjects: (query) =>
+        aki(StagesApi)
+            .stagesAuthenticatorValidateList(withQuery(query, { ordering: "name" }))
+            .then(({ results }) => results),
+    keyOf: (stage) => stage.pk,
+    labelOf: (stage) => stage.name,
+    groupBy: groupStages,
+};
+
+@customElement("ak-stage-identification-form")
+export class IdentificationStageForm extends BaseStageForm<IdentificationStage> {
+    static styles = [
+        ...super.styles,
+        css`
+            ak-checkbox-group::part(checkbox-group) {
+                padding-top: var(--pf-c-form--m-horizontal__group-label--md--PaddingTop);
+            }
+        `,
+    ];
+
+    protected endpoints = {
+        load: (stageUuid: string) => aki(StagesApi).stagesIdentificationRetrieve({ stageUuid }),
+        create: (identificationStageRequest: IdentificationStage) =>
+            aki(StagesApi).stagesIdentificationCreate({ identificationStageRequest }),
+        update: (stageUuid: string, identificationStageRequest: IdentificationStage) =>
+            aki(StagesApi).stagesIdentificationUpdate({ stageUuid, identificationStageRequest }),
+    };
+
+    isUserFieldSelected(field: UserFieldsEnum): boolean {
+        return (
+            (this.instance?.userFields || []).filter((isField) => {
+                return field === isField;
+            }).length > 0
+        );
+    }
+
+    protected override renderForm(): TemplateResult {
+        const userSelectFields = [
+            { name: UserFieldsEnum.Username, label: msg("Username") },
+            { name: UserFieldsEnum.Email, label: msg("Email") },
+            { name: UserFieldsEnum.Upn, label: msg("UPN") },
+        ];
+
+        return html`<span>
+                ${msg("Let the user identify themselves with their username or Email address.")}
+            </span>
+            <ak-text-input
+                label=${msg("Stage Name", {
+                    id: "stage.name.label",
+                })}
+                required
+                name="name"
+                value=${this.instance?.name || ""}
+                placeholder=${msg("Type a name for this stage...", {
+                    id: "stage.name.placeholder",
+                })}
+                ?autofocus=${!this.instance}
+            ></ak-text-input>
+            <ak-form-group open label="${msg("Stage-specific settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal name="userFields">
+                        ${AKLabel(
+                            {
+                                slot: "label",
+                                className: "pf-c-form__group-label",
+                                htmlFor: "userFields",
+                            },
+                            msg("User Fields"),
+                        )}
+
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Fields a user can identify themselves with. If no fields are selected, the user will only be able to use sources.",
+                            )}
+                        </p>
+
+                        <ak-checkbox-group
+                            class="user-field-select"
+                            .options=${userSelectFields}
+                            .value=${userSelectFields
+                                .map(({ name }) => name)
+                                .filter((name) => this.isUserFieldSelected(name))}
+                        ></ak-checkbox-group>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal label=${msg("Password stage")} name="passwordStage">
+                        ${AKSearchSelect({
+                            name: "passwordStage",
+                            source: passwordStageSource,
+                            value: this.instance?.passwordStage,
+                            blankable: true,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "When selected, a password field is shown on the same page instead of a separate page. This prevents username enumeration attacks.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal label=${msg("Captcha stage")} name="captchaStage">
+                        ${AKSearchSelect({
+                            name: "captchaStage",
+                            source: captchaStageSource,
+                            value: this.instance?.captchaStage,
+                            blankable: true,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "When set, adds functionality exactly like a Captcha stage, but baked into the Identification stage.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-switch-input
+                        name="caseInsensitiveMatching"
+                        label=${msg("Case insensitive matching")}
+                        ?checked=${this.instance?.caseInsensitiveMatching ?? true}
+                        help=${msg(
+                            "When enabled, user fields are matched regardless of their casing.",
+                        )}
+                    ></ak-switch-input>
+                    <ak-switch-input
+                        name="pretendUserExists"
+                        label=${msg("Pretend user exists")}
+                        ?checked=${this.instance?.pretendUserExists ?? true}
+                        help=${msg(
+                            "When enabled, the stage will always accept the given user identifier and continue.",
+                        )}
+                    ></ak-switch-input>
+                    <ak-switch-input
+                        name="showMatchedUser"
+                        label=${msg("Show matched user")}
+                        ?checked=${this.instance?.showMatchedUser ?? true}
+                        help=${msg(
+                            "When a valid username/email has been entered, and this option is enabled, the user's username and avatar will be shown. Otherwise, the text that the user entered will be shown.",
+                        )}
+                    ></ak-switch-input>
+                    <ak-switch-input
+                        name="enableRememberMe"
+                        label=${msg('Enable "Remember me on this device"')}
+                        ?checked=${this.instance?.enableRememberMe}
+                        help=${msg(
+                            "When enabled, the user can save their username in a cookie, allowing them to skip directly to entering their password.",
+                        )}
+                    ></ak-switch-input>
+                </div>
+            </ak-form-group>
+            <ak-form-group label="${msg("Passkey settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal
+                        label=${msg("WebAuthn Authenticator Validation Stage")}
+                        name="webauthnStage"
+                    >
+                        ${AKSearchSelect({
+                            name: "webauthnStage",
+                            source: authenticatorValidateStageSource,
+                            value: this.instance?.webauthnStage,
+                            blankable: true,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "When set, allows users to authenticate using passkeys directly from the browser's autofill dropdown without entering a username first.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                </div>
+            </ak-form-group>
+            <ak-form-group label="${msg("Source settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal label=${msg("Sources")} required name="sources">
+                        <ak-dual-select-dynamic-selected
+                            .provider=${sourcesProvider}
+                            .selector=${sourcesSelector(this.instance?.sources)}
+                            available-label="${msg("Available Sources")}"
+                            selected-label="${msg("Selected Sources")}"
+                        ></ak-dual-select-dynamic-selected>
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Select sources should be shown for users to authenticate with. This only affects web-based sources, not LDAP.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-switch-input
+                        name="showSourceLabels"
+                        label=${msg("Show sources' labels")}
+                        ?checked=${this.instance?.showSourceLabels ?? false}
+                        help=${msg(
+                            "By default, only icons are shown for sources. Enable this to show their full names.",
+                        )}
+                    ></ak-switch-input>
+                </div>
+            </ak-form-group>
+            <ak-form-group label="${msg("Flow settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal
+                        label=${msg("Passwordless flow")}
+                        name="passwordlessFlow"
+                    >
+                        ${AKFlowSearch({
+                            name: "passwordlessFlow",
+                            flowType: FlowDesignationEnum.Authentication,
+                            value: this.instance?.passwordlessFlow,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Optional passwordless flow, which is linked at the bottom of the page. When configured, users can use this flow to authenticate with a WebAuthn authenticator, without entering any details.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Enrollment flow")}
+                        name="enrollmentFlow"
+                    >
+                        ${AKFlowSearch({
+                            name: "enrollmentFlow",
+                            flowType: FlowDesignationEnum.Enrollment,
+                            value: this.instance?.enrollmentFlow,
+                        })}
+
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Optional enrollment flow, which is linked at the bottom of the page.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal label=${msg("Recovery flow")} name="recoveryFlow">
+                        ${AKFlowSearch({
+                            name: "recoveryFlow",
+                            flowType: FlowDesignationEnum.Recovery,
+                            value: this.instance?.recoveryFlow,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Optional recovery flow, which is linked at the bottom of the page.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                </div>
+            </ak-form-group>`;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-stage-identification-form": IdentificationStageForm;
+    }
+}

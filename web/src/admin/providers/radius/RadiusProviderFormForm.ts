@@ -1,0 +1,143 @@
+import "#elements/ak-dual-select/ak-dual-select-dynamic-selected-provider";
+import "#components/ak-switch-input";
+import "#components/ak-secret-text-input";
+import "#components/ak-text-input";
+import "#elements/forms/FormGroup";
+import "#elements/forms/HorizontalFormElement";
+import "#elements/forms/SearchSelect/index";
+import "#elements/LicenseNotice";
+import { propertyMappingsProvider, propertyMappingsSelector } from "./RadiusProviderFormHelpers.js";
+
+import { ascii_letters, digits, randomString } from "#common/utils";
+
+import { AKCertificateSearch } from "#admin/common/AKCertificateSearch";
+import { TLSKeyTypes } from "#admin/common/certificate-key-types";
+import {
+    AKAuthorizationFlowField,
+    AKInvalidationFlowField,
+} from "#admin/providers/components/flow-fields";
+
+import {
+    CurrentBrand,
+    FlowDesignationEnum,
+    RadiusProvider,
+    ValidationError,
+} from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { html } from "lit";
+import { ifDefined } from "lit/directives/if-defined.js";
+
+const mfaSupportHelp = msg(
+    "When enabled, code-based multi-factor authentication can be used by appending a semicolon and the TOTP code to the password. This should only be enabled if all users that will bind to this provider have a TOTP device configured, as otherwise a password may incorrectly be rejected if it contains a semicolon.",
+);
+
+const clientNetworksHelp = msg(
+    "List of CIDRs (comma-separated) that clients can connect from. A more specific CIDR will match before a looser one. Clients connecting from a non-specified CIDR will be dropped.",
+);
+
+export interface RADIUSProviderFormProps {
+    provider?: Partial<RadiusProvider> | null;
+    errors?: ValidationError | null;
+    brand?: CurrentBrand | null;
+}
+
+// All Provider objects have an Authorization flow, but not all providers have an Authentication
+// flow. Radius needs only one field, but it is not the Authorization field, it is an
+// Authentication field. So, yeah, we're using the authorization field to store the
+// authentication information, which is why the ak-branded-flow-search call down there looks so
+// weird-- we're looking up Authentication flows, but we're storing them in the Authorization
+// field of the target Provider.
+
+export function renderForm({ provider, errors, brand }: RADIUSProviderFormProps) {
+    provider ||= {};
+    errors ||= {};
+
+    return html`
+        <ak-text-input
+            name="name"
+            label=${msg("Provider Name")}
+            placeholder=${msg("Type a provider name...")}
+            autocomplete="off"
+            value=${ifDefined(provider.name)}
+            .errorMessages=${errors.name}
+            required
+        >
+        </ak-text-input>
+
+        ${AKAuthorizationFlowField({
+            label: msg("Authentication Flow"),
+            placeholder: msg("Select an authentication flow..."),
+            help: msg("Flow used for users to authenticate."),
+            flowType: FlowDesignationEnum.Authentication,
+            value: provider.authorizationFlow,
+            defaultFlowSlug: brand?.flowAuthentication,
+            errors: errors.authorizationFlow,
+        })}
+
+        <ak-switch-input
+            name="mfaSupport"
+            label=${msg("Code-based MFA Support")}
+            ?checked=${provider.mfaSupport ?? true}
+            help=${mfaSupportHelp}
+        >
+        </ak-switch-input>
+
+        <ak-form-group open label="${msg("Protocol settings")}">
+            <div class="pf-c-form">
+                <ak-secret-text-input
+                    name="sharedSecret"
+                    label=${msg("Shared secret")}
+                    .errorMessages=${errors.sharedSecret}
+                    value=${ifDefined(
+                        provider.pk
+                            ? provider.sharedSecret
+                            : randomString(128, ascii_letters + digits),
+                    )}
+                    input-hint="code"
+                    plaintext
+                    ?required=${!provider.pk}
+                    ?revealed=${!provider.pk}
+                ></ak-secret-text-input>
+                <ak-text-input
+                    name="clientNetworks"
+                    label=${msg("Client Networks")}
+                    value=${provider.clientNetworks ?? "0.0.0.0/0, ::/0"}
+                    .errorMessages=${errors.clientNetworks}
+                    required
+                    help=${clientNetworksHelp}
+                    input-hint="code"
+                ></ak-text-input>
+                <ak-form-element-horizontal label=${msg("Certificate")} name="certificate">
+                    ${AKCertificateSearch({ name: "certificate", value: provider?.certificate, allowedKeyTypes: TLSKeyTypes })}
+                    <p class="pf-c-form__helper-text">
+                        ${msg(
+                            "Certificate used for EAP-TLS. Requires Mutual TLS Stage in authentication flow.",
+                        )}
+                    </p>
+                    <ak-license-notice></ak-license-notice>
+                </ak-form-element-horizontal>
+                <ak-form-element-horizontal
+                    label=${msg("Property mappings")}
+                    name="propertyMappings"
+                >
+                    <ak-dual-select-dynamic-selected
+                        .provider=${propertyMappingsProvider}
+                        .selector=${propertyMappingsSelector(provider.propertyMappings)}
+                        available-label=${msg("Available Property Mappings")}
+                        selected-label=${msg("Selected Property Mappings")}
+                    ></ak-dual-select-dynamic-selected>
+                </ak-form-element-horizontal>
+            </div>
+        </ak-form-group>
+        <ak-form-group label="${msg("Advanced flow settings")}">
+            <div class="pf-c-form">
+                ${AKInvalidationFlowField({
+                    value: provider.invalidationFlow,
+                    defaultFlowSlug: "default-invalidation-flow",
+                    errors: errors.invalidationFlow,
+                })}
+            </div></ak-form-group
+        >
+    `;
+}

@@ -1,0 +1,418 @@
+import "#admin/sidebar/Bookmarks/Bookmark";
+import "#elements/banner/EnterpriseStatusBanner";
+import "#elements/banner/VersionBanner";
+import "#elements/sidebar/Sidebar";
+import "#elements/router/core/RouterView";
+import "#elements/commands/ak-command-palette";
+import "#elements/commands/ak-command-palette-user-modal";
+import "#components/notifications/APIDrawer";
+import "#components/notifications/NotificationDrawer";
+import "#components/ak-page-navbar";
+import "#admin/sidebar/VersionDetails";
+import "#admin/sidebar/BreadcrumbWrapper";
+import PFBanner from "@patternfly/patternfly/components/Banner/banner.css";
+import PFButton from "@patternfly/patternfly/components/Button/button.css";
+import PFDrawer from "@patternfly/patternfly/components/Drawer/drawer.css";
+import PFNav from "@patternfly/patternfly/components/Nav/nav.css";
+import PFPage from "@patternfly/patternfly/components/Page/page.css";
+
+import { isAPIResultReady } from "#common/api/responses";
+import { globalAK } from "#common/global";
+import { isGuest } from "#common/users";
+import { WebsocketClient } from "#common/ws/WebSocketClient";
+
+import { AuthenticatedInterface } from "#elements/AuthenticatedInterface";
+import {
+    CommandPrefix,
+    PaletteCommandDefinitionInit,
+    PaletteCommandNamespace,
+} from "#elements/commands/shared";
+import { listen } from "#elements/decorators/listen";
+import { renderDialog } from "#elements/dialogs";
+import { WithCapabilitiesConfig } from "#elements/mixins/capabilities";
+import { WithLicenseSummary } from "#elements/mixins/license";
+import { WithNotifications } from "#elements/mixins/notifications";
+import { canAccessAdmin, WithSession } from "#elements/mixins/session";
+import {
+    currentInterfacePath,
+    formatInterfacePrefix,
+    toAdminInterface,
+    toUserInterface,
+} from "#elements/router/core/interfaces";
+import { matchRoute } from "#elements/router/core/matcher";
+import { navigate, RouterNavigateEvent } from "#elements/router/core/navigation";
+import { SlottedTemplateResult } from "#elements/types";
+import { ifPresent } from "#elements/utils/attributes";
+
+import { AKDrawerChangeEvent } from "#components/notifications/events";
+import { renderNotificationDrawerPanel } from "#components/notifications/panel";
+import {
+    DrawerState,
+    persistDrawerParams,
+    readDrawerParams,
+} from "#components/notifications/utils";
+
+import Styles from "#admin/ak-interface-admin.css";
+import { DEFAULT_PATH, ROUTES } from "#admin/Routes";
+import { BookmarkController } from "#admin/sidebar/Bookmarks/BookmarkController";
+import { bookmarksToSidebar } from "#admin/sidebar/Bookmarks/bookmarkToSidebar";
+import { BreadcrumbController } from "#admin/sidebar/BreadcrumbController";
+import { createAdminSidebarEntries } from "#admin/sidebar/constants";
+import {
+    ExtendedSidebarItem,
+    findCurrentSidebarKey,
+    findCurrentSidebarSectionLabel,
+    resolveSidebarEntries,
+} from "#admin/sidebar/sidebarTools";
+
+import { CapabilitiesEnum } from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { CSSResult, html, PropertyValues, TemplateResult } from "lit";
+import { customElement, property, state } from "lit/decorators.js";
+import { classMap } from "lit/directives/class-map.js";
+import { guard } from "lit/directives/guard.js";
+let lastRoutePath: string | null = null;
+let lastRouteName: string | null = null;
+
+function routeNameForPath(path: string): string | null {
+    if (path !== lastRoutePath) {
+        lastRoutePath = path;
+        lastRouteName = matchRoute(path, ROUTES)?.route.name ?? null;
+    }
+
+    return lastRouteName;
+}
+
+@customElement("ak-interface-admin")
+export class AdminInterface extends WithLicenseSummary(
+    WithCapabilitiesConfig(WithNotifications(WithSession(AuthenticatedInterface))),
+) {
+    //#region Styles
+
+    public static readonly styles: CSSResult[] = [
+        PFPage,
+        PFButton,
+        PFDrawer,
+        PFNav,
+        PFBanner,
+        Styles,
+    ];
+
+    //#endregion
+
+    //#region Public Properties
+
+    @property({ type: Boolean, reflect: true, attribute: "sidebar" })
+    public sidebarOpen = false;
+
+    public get navigationEntries(): readonly ExtendedSidebarItem[] {
+        const canEnterprise = this.can(CapabilitiesEnum.IsEnterprise);
+
+        const entries = createAdminSidebarEntries(canEnterprise);
+
+        const result = resolveSidebarEntries(entries, {
+            canEnterprise,
+            // Assume licensed until the summary loads so the notice doesn't flash.
+            licensed: !this.licenseSummary || this.hasEnterpriseLicense,
+        });
+
+        return bookmarksToSidebar(result, this.bookmarkManager.bookmarks ?? []);
+    }
+
+    //#endregion
+
+    //#region Public Methods
+
+    public toggleSidebar = () => {
+        this.sidebarOpen = !this.sidebarOpen;
+    };
+
+    //#endregion
+
+    //#region Event Listeners
+
+    #sidebarMatcher: MediaQueryList;
+    #sidebarMediaQueryListener = (event: MediaQueryListEvent) => {
+        this.sidebarOpen = event.matches;
+    };
+
+    // Recompute the sidebar default on every route change. The path-routing
+    // outlet drives navigation through `RouterNavigateEvent` (push/replace) and
+    // `popstate` (back/forward) rather than the legacy `ak-route-change` event.
+    #routeChangeListener = () => {
+        this.sidebarOpen = this.#sidebarMatcher.matches;
+        this.pathname = window.location.pathname;
+    };
+
+    private _breadcrumbManager = new BreadcrumbController(this);
+
+    private bookmarkManager = new BookmarkController(this);
+
+    /**
+     * The current `location.pathname`, tracked so the navbar's section follows
+     * the route. Kept raw rather than interface-relative: this element upgrades
+     * before the entrypoint calls `initRouter`, so the prefix is only stripped at
+     * render time.
+     */
+    @state()
+    public pathname = window.location.pathname;
+
+    @state()
+    protected drawer: DrawerState = readDrawerParams();
+
+    @listen(AKDrawerChangeEvent, { target: window })
+    protected drawerListener = (event: AKDrawerChangeEvent) => {
+        this.drawer = event.drawer;
+        persistDrawerParams(event.drawer);
+    };
+
+    //#endregion
+
+    //#region Lifecycle
+
+    constructor() {
+        super();
+
+        WebsocketClient.connect();
+
+        this.#sidebarMatcher = matchMedia("(width > 1210px)");
+        this.sidebarOpen = this.#sidebarMatcher.matches;
+    }
+
+    #refreshCommandsFrameID = -1;
+
+    #refreshCommands = () => {
+        const commands: PaletteCommandDefinitionInit[] = [
+            {
+                label: msg("Create a new application..."),
+                action: () =>
+                    navigate(
+                        toAdminInterface("core/applications", { "create-wizard": "application" }),
+                    ),
+                group: msg("Applications"),
+            },
+            ...this.navigationEntries.flatMap(({ label, children }: ExtendedSidebarItem) =>
+                (children ?? []).flatMap(({ path, label: childLabel }: ExtendedSidebarItem) => {
+                    const command: PaletteCommandDefinitionInit = {
+                        namespace: PaletteCommandNamespace.Navigation,
+                        label: childLabel,
+                        group: label,
+                        action: () => navigate(path!),
+                    };
+
+                    return [command];
+                }),
+            ),
+            {
+                namespace: PaletteCommandNamespace.Search,
+                label: msg("Username or email address..."),
+                prefix: CommandPrefix.SearchFor(),
+                group: msg("Users"),
+                keywords: [msg("search"), msg("find")],
+                action: async (_data, event) => {
+                    event?.stopPropagation();
+
+                    const userPalette = this.ownerDocument.createElement(
+                        "ak-command-palette-user-modal",
+                    );
+
+                    renderDialog(userPalette, {
+                        parentElement: this,
+                    });
+
+                    userPalette.show();
+                },
+            },
+        ];
+
+        this.commandPalette.modal.setCommands(
+            commands.map((command) => ({ namespace: PaletteCommandNamespace.Action, ...command })),
+        );
+    };
+
+    public connectedCallback() {
+        super.connectedCallback();
+
+        this.#sidebarMatcher.addEventListener("change", this.#sidebarMediaQueryListener, {
+            passive: true,
+        });
+
+        window.addEventListener(RouterNavigateEvent.eventName, this.#routeChangeListener);
+        window.addEventListener("popstate", this.#routeChangeListener);
+    }
+
+    public disconnectedCallback(): void {
+        super.disconnectedCallback();
+
+        cancelAnimationFrame(this.#refreshCommandsFrameID);
+
+        this.#sidebarMatcher.removeEventListener("change", this.#sidebarMediaQueryListener);
+
+        window.removeEventListener(RouterNavigateEvent.eventName, this.#routeChangeListener);
+        window.removeEventListener("popstate", this.#routeChangeListener);
+
+        WebsocketClient.close();
+    }
+
+    public firstUpdated(changedProperties: PropertyValues<this>): void {
+        super.firstUpdated(changedProperties);
+
+        this.#refreshCommandsFrameID = requestAnimationFrame(this.#refreshCommands);
+    }
+
+    public override updated(changedProperties: PropertyValues<this>): void {
+        super.updated(changedProperties);
+
+        if (changedProperties.has("session") && isAPIResultReady(this.session)) {
+            if (!isGuest(this.session.user) && !canAccessAdmin(this.session.user)) {
+                window.location.assign(toUserInterface());
+            }
+        }
+    }
+
+    //#endregion
+
+    //#region Rendering
+
+    protected override render(): TemplateResult {
+        if (!isAPIResultReady(this.session) || !canAccessAdmin(this.session.user)) {
+            return html`<slot></slot>`;
+        }
+
+        const path = currentInterfacePath(this.pathname);
+        const routeName = routeNameForPath(path);
+        const entries = this.navigationEntries;
+
+        const sidebarClasses = {
+            "pf-c-page__sidebar": true,
+            "pf-m-expanded": this.sidebarOpen,
+            "pf-m-collapsed": !this.sidebarOpen,
+        };
+
+        const openDrawerCount = (this.drawer.notifications ? 1 : 0) + (this.drawer.api ? 1 : 0);
+
+        const drawerClasses = {
+            "pf-m-expanded": openDrawerCount !== 0,
+            "pf-m-collapsed": openDrawerCount === 0,
+        };
+
+        return html`<div class="pf-c-page">
+                <ak-page-navbar
+                    .section=${findCurrentSidebarSectionLabel(entries, routeName, this.pathname)}
+                >
+                    <button
+                        slot="toggle"
+                        aria-controls="global-nav"
+                        class="pf-c-button pf-m-plain"
+                        @click=${this.toggleSidebar}
+                        aria-label=${
+                            this.sidebarOpen ? msg("Collapse navigation") : msg("Expand navigation")
+                        }
+                        aria-expanded=${this.sidebarOpen ? "true" : "false"}
+                    >
+                        <i aria-hidden="true" class="fas fa-bars"></i>
+                    </button>
+
+                    ${this.renderCommandPaletteButton()}
+                    <ak-version-banner></ak-version-banner>
+                    <ak-enterprise-status interface="admin"></ak-enterprise-status>
+                    <ak-ui-bookmark slot="bookmark"></ak-ui-bookmark>
+                    <ak-ui-breadcrumbs slot="breadcrumbs"></ak-ui-breadcrumbs>
+                </ak-page-navbar>
+
+                <ak-sidebar
+                    id="global-nav"
+                    ?hidden=${!this.sidebarOpen}
+                    class="${classMap(sidebarClasses)}"
+                    .entries=${entries}
+                    current=${ifPresent(findCurrentSidebarKey(entries, routeName, path))}
+                >
+                    <ak-version-details slot="footer"></ak-version-details>
+                </ak-sidebar>
+
+                <div class="pf-c-page__drawer">
+                    <div class="pf-c-drawer ${classMap(drawerClasses)}">
+                        <div class="pf-c-drawer__main">
+                            <div class="pf-c-drawer__content">
+                                <div class="pf-c-drawer__body">
+                                    <ak-router-view
+                                        role="presentation"
+                                        class="pf-c-page__main"
+                                        tabindex="-1"
+                                        id="main-content"
+                                        .routes=${ROUTES}
+                                        .prefix=${formatInterfacePrefix(
+                                            globalAK().api.relBase,
+                                            "admin",
+                                        )}
+                                        .defaultPath=${DEFAULT_PATH}
+                                    >
+                                    </ak-router-view>
+                                </div>
+                            </div>
+                            ${renderNotificationDrawerPanel(this.drawer)}
+                        </div>
+                    </div>
+
+                    <div
+                        class="pf-c-page__sidebar-backdrop"
+                        aria-label=${this.sidebarOpen ? msg("Close sidebar") : msg("Open sidebar")}
+                        @click=${this.toggleSidebar}
+                        role="button"
+                        tabindex="0"
+                    ></div>
+                </div>
+            </div>
+            ${this.commandPalette}`;
+    }
+
+    protected renderCommandPaletteButton(): SlottedTemplateResult {
+        return guard([this.commandPalette.showListener], () => {
+            const macOS = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
+
+            const primaryModifierKey = macOS ? "⌘" : "Ctrl";
+
+            return html`<button
+                slot="nav-buttons"
+                @click=${this.commandPalette.showListener}
+                class="pf-c-button pf-m-plain command-palette-trigger"
+                aria-label=${msg("Open Command Palette", {
+                    id: "command-palette-trigger-label",
+                    desc: "Label for the button that opens the command palette",
+                })}
+            >
+                <pf-tooltip position="top-end">
+                    <div slot="content" class="ak-tooltip__content--inline">
+                        ${msg("Open Command Palette", {
+                            id: "command-palette-trigger-tooltip",
+                            desc: "Tooltip for the button that opens the command palette",
+                        })}
+                        <div class="ak-c-kbd"><kbd>${primaryModifierKey}</kbd> + <kbd>K</kbd></div>
+                    </div>
+
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        aria-hidden="true"
+                        class="ak-c-vector-icon"
+                        role="img"
+                        viewBox="0 0 32 32"
+                    >
+                        <path
+                            d="M26 4.01H6a2 2 0 0 0-2 2v20a2 2 0 0 0 2 2h20a2 2 0 0 0 2-2v-20a2 2 0 0 0-2-2m0 2v4H6v-4Zm-20 20v-14h20v14Z"
+                        />
+                        <path d="m10.76 16.18 2.82 2.83-2.82 2.83 1.41 1.41 4.24-4.24-4.24-4.24z" />
+                    </svg>
+                </pf-tooltip>
+            </button>`;
+        });
+    }
+
+    //#endregion
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-interface-admin": AdminInterface;
+    }
+}

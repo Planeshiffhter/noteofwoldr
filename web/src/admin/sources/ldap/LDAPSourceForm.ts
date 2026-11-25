@@ -1,0 +1,454 @@
+import "#components/ak-secret-text-input";
+import "#components/ak-slug-input";
+import "#components/ak-radio-input";
+import "#components/ak-switch-input";
+import "#elements/ak-dual-select/ak-dual-select-dynamic-selected-provider";
+import "#elements/forms/FormGroup";
+import "#elements/forms/HorizontalFormElement";
+import { propertyMappingsProvider, propertyMappingsSelector } from "./LDAPSourceFormHelpers.js";
+
+import { aki } from "#common/api/client";
+
+import type { ModelEndpoints } from "#elements/forms/ModelForm";
+import { RadioOption } from "#elements/forms/Radio";
+
+import { AKSearchSelect } from "#components/ak-search-select-field";
+
+import { AKCertificateSearch } from "#admin/common/AKCertificateSearch";
+import { groupSource } from "#admin/common/search-sources";
+import { placeholderHelperText } from "#admin/helperText";
+import { BaseSourceForm } from "#admin/sources/BaseSourceForm";
+
+import {
+    LDAPSource,
+    LDAPSourceRequest,
+    ServiceBindMethodEnum,
+    SourcesApi,
+    SyncOutgoingTriggerModeEnum,
+} from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { html, TemplateResult } from "lit";
+import { customElement } from "lit/decorators.js";
+import { ifDefined } from "lit/directives/if-defined.js";
+
+function createSyncOutgoingTriggerModeOptions(): RadioOption<SyncOutgoingTriggerModeEnum>[] {
+    return [
+        {
+            label: msg("None"),
+            value: SyncOutgoingTriggerModeEnum.None,
+            description: html`${msg("Outgoing syncs will not be triggered.")}`,
+        },
+        {
+            label: msg("Immediate"),
+            value: SyncOutgoingTriggerModeEnum.Immediate,
+            description: html`${msg(
+                "Outgoing syncs will be triggered immediately for each object that is updated. This can create many background tasks and is therefore not recommended",
+            )}`,
+        },
+        {
+            label: msg("Deferred until end"),
+            value: SyncOutgoingTriggerModeEnum.DeferredEnd,
+            default: true,
+            description: html`${msg(
+                "Outgoing syncs will be triggered at the end of the source synchronization.",
+            )}`,
+        },
+    ];
+}
+
+@customElement("ak-source-ldap-form")
+export class LDAPSourceForm extends BaseSourceForm<LDAPSource, LDAPSourceRequest> {
+    protected endpoints: ModelEndpoints<LDAPSource, string, LDAPSourceRequest> = {
+        load: (slug: string) => aki(SourcesApi).sourcesLdapRetrieve({ slug }),
+        create: (lDAPSourceRequest) =>
+            aki(SourcesApi).sourcesLdapCreate({
+                lDAPSourceRequest,
+            }),
+        update: (slug, patchedLDAPSourceRequest) =>
+            aki(SourcesApi).sourcesLdapPartialUpdate({ slug, patchedLDAPSourceRequest }),
+    };
+
+    protected override renderForm(): TemplateResult {
+        // Field names go through `this.field()` so they're checked against
+        // LDAPSourceRequest; the generated client silently drops unrecognized properties.
+        return html` <ak-form-element-horizontal
+                label=${msg("Name")}
+                required
+                name=${this.field("name")}
+            >
+                <input
+                    type="text"
+                    value="${ifDefined(this.instance?.name)}"
+                    class="pf-c-form-control"
+                    required
+                />
+            </ak-form-element-horizontal>
+
+            <ak-slug-input
+                name=${this.field("slug")}
+                value=${ifDefined(this.instance?.slug)}
+                label=${msg("Slug")}
+                required
+                input-hint="code"
+            ></ak-slug-input>
+
+            <ak-switch-input
+                name=${this.field("enabled")}
+                label=${msg("Enabled")}
+                ?checked=${this.instance?.enabled ?? true}
+            ></ak-switch-input>
+            <ak-switch-input
+                name=${this.field("passwordLoginUpdateInternalPassword")}
+                label=${msg("Update internal password on login")}
+                ?checked=${this.instance?.passwordLoginUpdateInternalPassword ?? false}
+                help=${msg(
+                    "When the user logs in to authentik using this source password backend, update their credentials in authentik.",
+                )}
+            ></ak-switch-input>
+            <ak-switch-input
+                name=${this.field("syncUsers")}
+                label=${msg("Sync users")}
+                ?checked=${this.instance?.syncUsers ?? true}
+            ></ak-switch-input>
+            <ak-switch-input
+                name=${this.field("syncUsersPassword")}
+                label=${msg("User password writeback")}
+                ?checked=${this.instance?.syncUsersPassword ?? true}
+                help=${msg(
+                    "Login password is synced from LDAP into authentik automatically. Enable this option only to write password changes in authentik back to LDAP.",
+                )}
+            ></ak-switch-input>
+            <ak-switch-input
+                name=${this.field("syncGroups")}
+                label=${msg("Sync groups")}
+                ?checked=${this.instance?.syncGroups ?? true}
+            ></ak-switch-input>
+            <ak-switch-input
+                name=${this.field("syncGroupHierarchy")}
+                label=${msg("Sync Group Hierarchy")}
+                ?checked=${this.instance?.syncGroupHierarchy ?? true}
+                help=${msg("Sync group hierarchy from LDAP directories.")}
+            ></ak-switch-input>
+            <ak-switch-input
+                name=${this.field("deleteNotFoundObjects")}
+                label=${msg("Delete Not Found Objects")}
+                ?checked=${this.instance?.deleteNotFoundObjects ?? false}
+                help=${msg(
+                    "Delete authentik users and groups which were previously supplied by this source, but are now missing from it.",
+                )}
+            ></ak-switch-input>
+            <ak-form-group open label="${msg("Connection settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal
+                        label=${msg("Server URI")}
+                        required
+                        name=${this.field("serverUri")}
+                    >
+                        <input
+                            type="text"
+                            placeholder="ldap://1.2.3.4"
+                            value="${ifDefined(this.instance?.serverUri)}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Specify multiple server URIs by separating them with a comma.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-switch-input
+                        name=${this.field("startTls")}
+                        label=${msg("Enable StartTLS")}
+                        ?checked=${this.instance?.startTls ?? true}
+                        help=${msg("To use SSL instead, use 'ldaps://' and disable this option.")}
+                    ></ak-switch-input>
+                    <ak-switch-input
+                        name=${this.field("sni")}
+                        label=${msg("Use Server URI for SNI verification")}
+                        ?checked=${this.instance?.sni ?? false}
+                        help=${msg("Required for servers using TLS 1.3+")}
+                    ></ak-switch-input>
+                    <ak-form-element-horizontal
+                        label=${msg("Service bind method", {
+                            id: "ldap-source.service-bind-method.label",
+                        })}
+                        required
+                        name=${this.field("serviceBindMethod")}
+                    >
+                        <select class="pf-c-form-control">
+                            <option
+                                value=${ServiceBindMethodEnum.Simple}
+                                ?selected=${
+                                    !this.instance?.serviceBindMethod ||
+                                    this.instance.serviceBindMethod === ServiceBindMethodEnum.Simple
+                                }
+                            >
+                                ${msg("Simple or anonymous bind", {
+                                    id: "ldap-source.service-bind-method.simple.label",
+                                })}
+                            </option>
+                            <option
+                                value=${ServiceBindMethodEnum.SaslExternal}
+                                ?selected=${
+                                    this.instance?.serviceBindMethod ===
+                                    ServiceBindMethodEnum.SaslExternal
+                                }
+                            >
+                                ${msg("SASL EXTERNAL", {
+                                    id: "ldap-source.service-bind-method.sasl-external.label",
+                                })}
+                            </option>
+                        </select>
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Simple bind uses the Bind CN and password, or binds anonymously when both are empty. SASL EXTERNAL uses the TLS client certificate for synchronization and writeback.",
+                                { id: "ldap-source.service-bind-method.description" },
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("TLS Verification Certificate")}
+                        name=${this.field("peerCertificate")}
+                    >
+                        ${AKCertificateSearch({ name: "peerCertificate", value: this.instance?.peerCertificate, noKey: true })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Leave empty to skip certificate validation, or select a certificate/keypair containing the LDAP server CA chain to validate the remote certificate.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("TLS Client authentication certificate")}
+                        name=${this.field("clientCertificate")}
+                    >
+                        ${AKCertificateSearch({ name: "clientCertificate", value: this.instance?.clientCertificate })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Client certificate keypair presented to the LDAP server. Required when the service bind method is SASL EXTERNAL.",
+                                { id: "ldap-source.client-certificate.description" },
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Bind CN")}
+                        name=${this.field("bindCn")}
+                    >
+                        <input
+                            type="text"
+                            value="${ifDefined(this.instance?.bindCn)}"
+                            class="pf-c-form-control"
+                        />
+                    </ak-form-element-horizontal>
+                    <ak-secret-text-input
+                        label=${msg("Bind Password")}
+                        name=${this.field("bindPassword")}
+                        ?revealed=${!this.instance}
+                    ></ak-secret-text-input>
+                    <ak-form-element-horizontal
+                        label=${msg("Base DN")}
+                        required
+                        name=${this.field("baseDn")}
+                    >
+                        <input
+                            type="text"
+                            value="${ifDefined(this.instance?.baseDn)}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                    </ak-form-element-horizontal>
+                </div>
+            </ak-form-group>
+            <ak-form-group open label="${msg("LDAP Attribute mapping")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal
+                        label=${msg("User Property Mappings")}
+                        name=${this.field("userPropertyMappings")}
+                    >
+                        <ak-dual-select-dynamic-selected
+                            .provider=${propertyMappingsProvider}
+                            .selector=${propertyMappingsSelector(
+                                this.instance?.userPropertyMappings,
+                            )}
+                            available-label="${msg("Available User Property Mappings")}"
+                            selected-label="${msg("Selected User Property Mappings")}"
+                        ></ak-dual-select-dynamic-selected>
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Property mappings for user creation.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Group Property Mappings")}
+                        name=${this.field("groupPropertyMappings")}
+                    >
+                        <ak-dual-select-dynamic-selected
+                            .provider=${propertyMappingsProvider}
+                            .selector=${propertyMappingsSelector(
+                                this.instance?.groupPropertyMappings,
+                            )}
+                            available-label="${msg("Available Group Property Mappings")}"
+                            selected-label="${msg("Selected Group Property Mappings")}"
+                        ></ak-dual-select-dynamic-selected>
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Property mappings for group creation.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                </div>
+            </ak-form-group>
+            <ak-form-group label="${msg("Additional settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal
+                        label=${msg("Additional Parent Group")}
+                        name=${this.field("syncParentGroup")}
+                    >
+                        ${AKSearchSelect({
+                            name: this.field("syncParentGroup"),
+                            source: groupSource,
+                            value: this.instance?.syncParentGroup,
+                            blankable: true,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Parent group for all the groups imported from LDAP.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("User path")}
+                        name=${this.field("userPathTemplate")}
+                    >
+                        <input
+                            type="text"
+                            value="${
+                                this.instance?.userPathTemplate ?? "goauthentik.io/sources/%(slug)s"
+                            }"
+                            class="pf-c-form-control"
+                        />
+                        <p class="pf-c-form__helper-text">${placeholderHelperText}</p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Additional User DN")}
+                        name=${this.field("additionalUserDn")}
+                    >
+                        <input
+                            type="text"
+                            value="${ifDefined(this.instance?.additionalUserDn)}"
+                            class="pf-c-form-control"
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Additional user DN, prepended to the Base DN.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Additional Group DN")}
+                        name=${this.field("additionalGroupDn")}
+                    >
+                        <input
+                            type="text"
+                            value="${ifDefined(this.instance?.additionalGroupDn)}"
+                            class="pf-c-form-control"
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Additional group DN, prepended to the Base DN.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("User object filter")}
+                        required
+                        name=${this.field("userObjectFilter")}
+                    >
+                        <input
+                            type="text"
+                            value="${this.instance?.userObjectFilter || "(objectClass=person)"}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Consider Objects matching this filter to be Users.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Group object filter")}
+                        required
+                        name=${this.field("groupObjectFilter")}
+                    >
+                        <input
+                            type="text"
+                            value="${this.instance?.groupObjectFilter || "(objectClass=group)"}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Consider Objects matching this filter to be Groups.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Group membership field")}
+                        required
+                        name=${this.field("groupMembershipField")}
+                    >
+                        <input
+                            type="text"
+                            value="${this.instance?.groupMembershipField || "member"}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg(
+                                "Field which contains members of a group. The value of this field is matched against User membership attribute.",
+                            )}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("User membership attribute")}
+                        required
+                        name=${this.field("userMembershipAttribute")}
+                    >
+                        <input
+                            type="text"
+                            value="${this.instance?.userMembershipAttribute || "distinguishedName"}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Attribute which matches the value of Group membership field.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-switch-input
+                        name=${this.field("lookupGroupsFromUser")}
+                        label=${msg("Lookup using user attribute")}
+                        ?checked=${this.instance?.lookupGroupsFromUser ?? false}
+                        help=${msg(
+                            "Field which contains DNs of groups the user is a member of. This field is used to lookup groups from users, e.g. 'memberOf'. To lookup nested groups in an Active Directory environment use 'memberOf:1.2.840.113556.1.4.1941:'.",
+                        )}
+                    ></ak-switch-input>
+                    <ak-form-element-horizontal
+                        label=${msg("Object uniqueness field")}
+                        required
+                        name=${this.field("objectUniquenessField")}
+                    >
+                        <input
+                            type="text"
+                            value="${this.instance?.objectUniquenessField || "objectSid"}"
+                            class="pf-c-form-control"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Field which contains a unique Identifier.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-radio-input
+                        label=${msg("Outgoing sync trigger mode")}
+                        required
+                        name=${this.field("syncOutgoingTriggerMode")}
+                        .value=${this.instance?.syncOutgoingTriggerMode}
+                        .options=${createSyncOutgoingTriggerModeOptions}
+                    >
+                    </ak-radio-input>
+                </div>
+            </ak-form-group>`;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-source-ldap-form": LDAPSourceForm;
+    }
+}

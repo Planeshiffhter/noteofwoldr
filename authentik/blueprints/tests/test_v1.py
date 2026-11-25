@@ -1,0 +1,484 @@
+"""Test blueprints v1"""
+
+from os import chmod, environ, unlink, write
+from pathlib import Path
+from tempfile import mkstemp
+from uuid import UUID
+
+from django.db.models.signals import post_save
+from django.test import TransactionTestCase
+from django.utils.text import slugify
+from yaml import load
+
+from authentik.blueprints.models import BlueprintInstance
+from authentik.blueprints.tests import apply_blueprint
+from authentik.blueprints.v1.common import BlueprintLoader, KeyOf
+from authentik.blueprints.v1.exporter import Exporter, FlowExporter
+from authentik.blueprints.v1.importer import Importer, transaction_rollback
+from authentik.core.models import Group
+from authentik.flows.models import Flow, FlowDesignation, FlowStageBinding
+from authentik.lib.generators import generate_id
+from authentik.lib.tests.utils import load_fixture
+from authentik.policies.expression.models import ExpressionPolicy
+from authentik.policies.models import PolicyBinding
+from authentik.sources.oauth.models import OAuthSource
+from authentik.stages.prompt.models import FieldTypes, Prompt, PromptStage
+from authentik.stages.user_login.models import UserLoginStage
+
+
+class TestBlueprintsV1(TransactionTestCase):
+    """Test Blueprints"""
+
+    def test_blueprint_invalid_format(self):
+        """Test blueprint with invalid format"""
+        importer = Importer.from_string('{"version": 3}')
+        self.assertFalse(importer.validate()[0])
+        importer = Importer.from_string(
+            '{"version": 1,"entries":[{"identifiers":{},"attrs":{},'
+            '"model": "authentik_core.User"}]}'
+        )
+        self.assertFalse(importer.validate()[0])
+        importer = Importer.from_string(
+            '{"version": 1, "entries": [{"attrs": {"name": "test"}, '
+            '"identifiers": {}, '
+            '"model": "authentik_core.Group"}]}'
+        )
+        self.assertFalse(importer.validate()[0])
+
+    def test_yaml_tag_repr_does_not_raise(self):
+        """repr() of a YAML tag must never raise (it is used by log sanitization)."""
+        tag = load("!KeyOf does-not-exist", Loader=BlueprintLoader)
+        self.assertIsInstance(repr(tag), str)
+
+    def test_validate_invalid_entry_holding_yaml_tag(self):
+        """An invalid entry that still holds a raw !KeyOf must return validation
+        errors instead of raising while sanitizing the logged entry."""
+        importer = Importer.from_string("""
+            version: 1
+            entries:
+                - model: authentik_providers_oauth2.scopemapping
+                  id: sm
+                  identifiers: { scope_name: test-tag-scope }
+                  attrs:
+                      name: test-tag-scope
+                      scope_name: test-tag-scope
+                      expression: "return {}"
+                - model: authentik_providers_oauth2.oauth2provider
+                  id: provider
+                  identifiers: { client_id: test-tag }
+                  attrs:
+                      name: test-tag
+                      client_id: test-tag
+                      property_mappings:
+                      - !KeyOf sm
+        """)
+        valid, logs = importer.validate()
+        self.assertFalse(valid)
+        self.assertGreater(len(logs), 0)
+
+    def test_validated_import_dict_identifiers(self):
+        """Test importing blueprints with dict identifiers."""
+        Group.objects.filter(name__istartswith="test").delete()
+
+        Group.objects.create(
+            name="test1",
+            attributes={
+                "key": ["value"],
+                "other_key": ["a_value", "other_value"],
+            },
+        )
+        Group.objects.create(
+            name="test2",
+            attributes={
+                "key": ["value"],
+                "other_key": ["diff_value", "other_diff_value"],
+            },
+        )
+
+        importer = Importer.from_string(
+            '{"version": 1, "entries": [{"attrs": {"name": "test999", "attributes": '
+            '{"key": ["updated_value"]}}, "identifiers": {"attributes": {"other_key": '
+            '["other_value"]}}, "model": "authentik_core.Group"}]}'
+        )
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())
+        self.assertTrue(
+            Group.objects.filter(
+                name="test2",
+                attributes={
+                    "key": ["value"],
+                    "other_key": ["diff_value", "other_diff_value"],
+                },
+            )
+        )
+        self.assertTrue(
+            Group.objects.filter(
+                name="test999",
+                # All attributes used as identifiers are kept and merged with the
+                # new attributes declared in the blueprint
+                attributes={"key": ["updated_value"], "other_key": ["other_value"]},
+            )
+        )
+        self.assertFalse(Group.objects.filter(name="test1"))
+
+    def test_export_validate_import(self):
+        """Test export and validate it"""
+        flow_slug = generate_id()
+        with transaction_rollback():
+            login_stage = UserLoginStage.objects.create(name=generate_id())
+
+            flow = Flow.objects.create(
+                slug=flow_slug,
+                designation=FlowDesignation.AUTHENTICATION,
+                name=generate_id(),
+                title=generate_id(),
+            )
+            FlowStageBinding.objects.update_or_create(
+                target=flow,
+                stage=login_stage,
+                order=0,
+            )
+
+            exporter = FlowExporter(flow)
+            export = exporter.export()
+            self.assertEqual(len(export.entries), 3)
+            export_yaml = exporter.export_to_string()
+
+        importer = Importer.from_string(export_yaml)
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())
+
+        self.assertTrue(Flow.objects.filter(slug=flow_slug).exists())
+
+    def test_export_validate_import_re_import(self):
+        """Test export and import it twice"""
+        count_initial = Prompt.objects.filter(field_key="username").count()
+
+        importer = Importer.from_string(load_fixture("fixtures/static_prompt_export.yaml"))
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())
+
+        count_before = Prompt.objects.filter(field_key="username").count()
+        self.assertEqual(count_initial + 1, count_before)
+
+        importer = Importer.from_string(load_fixture("fixtures/static_prompt_export.yaml"))
+        self.assertTrue(importer.apply())
+
+        self.assertEqual(Prompt.objects.filter(field_key="username").count(), count_before)
+
+    def test_nested_context_keys(self):
+        """Test nested context keys resolution"""
+        importer = Importer.from_string(load_fixture("fixtures/nested_contexts.yaml"))
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())
+
+        self.assertTrue(Group.objects.filter(name="not-nested").exists())
+        self.assertTrue(Group.objects.filter(name="nested").exists())
+        self.assertTrue(Group.objects.filter(name="list-element").exists())
+        self.assertTrue(Group.objects.filter(name="has-priority").exists())
+        self.assertTrue(Group.objects.filter(name="ref-value").exists())
+        self.assertTrue(Group.objects.filter(name="default-value").exists())
+
+    @apply_blueprint("system/providers-oauth2.yaml")
+    def test_import_yaml_tags(self):
+        """Test some yaml tags"""
+        ExpressionPolicy.objects.filter(name="foo-bar-baz-qux").delete()
+        Group.objects.filter(name="test").delete()
+        environ["foo"] = generate_id()
+        file, file_name = mkstemp()
+        write(file, b"foo")
+        _, file_default_name = mkstemp()
+        chmod(file_default_name, 0o000)  # Remove all permissions so we can't read the file
+        importer = Importer.from_string(
+            load_fixture(
+                "fixtures/tags.yaml",
+                file_name=file_name,
+                file_default_name=file_default_name,
+            ),
+            {"bar": "baz"},
+        )
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())
+        policy = ExpressionPolicy.objects.filter(name="foo-bar-baz-qux").first()
+        self.assertTrue(policy)
+        group = Group.objects.filter(name="test").first()
+        self.assertIsNotNone(group)
+        self.assertEqual(
+            group.attributes,
+            {
+                "policy_pk1": str(policy.pk) + "-suffix",
+                "policy_pk2": str(policy.pk) + "-suffix",
+                "boolEq": True,
+                "boolNeq": False,
+                "boolAnd": True,
+                "boolNand": False,
+                "boolOr": True,
+                "boolNor": False,
+                "boolXor": True,
+                "boolXnor": False,
+                "boolComplex": True,
+                "if_true_complex": {
+                    "dictionary": {
+                        "with": {"keys": "and_values"},
+                        "and_nested_custom_tags": "foo-bar",
+                    }
+                },
+                "if_false_complex": ["list", "with", "items", "foo-bar"],
+                "if_true_simple": True,
+                "if_short": True,
+                "if_false_simple": 2,
+                "enumerate_mapping_to_mapping": {
+                    "prefix-key1": "other-prefix-value",
+                    "prefix-key2": "other-prefix-2",
+                },
+                "enumerate_mapping_to_sequence": [
+                    "prefixed-pair-key1-value",
+                    "prefixed-pair-key2-2",
+                ],
+                "enumerate_sequence_to_sequence": [
+                    "prefixed-items-0-foo",
+                    "prefixed-items-1-bar",
+                ],
+                "enumerate_sequence_to_mapping": {"index: 0": "foo", "index: 1": "bar"},
+                "nested_complex_enumeration": {
+                    "0": {
+                        "key1": [
+                            ["prefixed-f", "prefixed-o", "prefixed-o"],
+                            {
+                                "outer_value": "foo",
+                                "outer_index": 0,
+                                "middle_value": "value",
+                                "middle_index": "key1",
+                            },
+                        ],
+                        "key2": [
+                            ["prefixed-f", "prefixed-o", "prefixed-o"],
+                            {
+                                "outer_value": "foo",
+                                "outer_index": 0,
+                                "middle_value": 2,
+                                "middle_index": "key2",
+                            },
+                        ],
+                    },
+                    "1": {
+                        "key1": [
+                            ["prefixed-b", "prefixed-a", "prefixed-r"],
+                            {
+                                "outer_value": "bar",
+                                "outer_index": 1,
+                                "middle_value": "value",
+                                "middle_index": "key1",
+                            },
+                        ],
+                        "key2": [
+                            ["prefixed-b", "prefixed-a", "prefixed-r"],
+                            {
+                                "outer_value": "bar",
+                                "outer_index": 1,
+                                "middle_value": 2,
+                                "middle_index": "key2",
+                            },
+                        ],
+                    },
+                },
+                "nested_context": "context-nested-value",
+                "env_null": None,
+                "file_content": "foo",
+                "file_default": "default",
+                "file_non_existent": None,
+                "json_parse": {"foo": "bar"},
+                "at_index_sequence": "foo",
+                "at_index_sequence_default": "non existent",
+                "at_index_mapping": 2,
+                "at_index_mapping_default": "non existent",
+                "find_object": "goauthentik.io/providers/oauth2/scope-openid",
+            },
+        )
+        self.assertTrue(
+            OAuthSource.objects.filter(
+                slug="test",
+                consumer_key=environ["foo"],
+            )
+        )
+        unlink(file_name)
+        unlink(file_default_name)
+
+    def test_export_validate_import_policies(self):
+        """Test export and validate it"""
+        flow_slug = generate_id()
+        stage_name = generate_id()
+        with transaction_rollback():
+            flow_policy = ExpressionPolicy.objects.create(
+                name=generate_id(),
+                expression="return True",
+            )
+            flow = Flow.objects.create(
+                slug=flow_slug,
+                designation=FlowDesignation.AUTHENTICATION,
+                name=generate_id(),
+                title=generate_id(),
+            )
+            PolicyBinding.objects.create(policy=flow_policy, target=flow, order=0)
+
+            user_login = UserLoginStage.objects.create(name=stage_name)
+            fsb = FlowStageBinding.objects.create(target=flow, stage=user_login, order=0)
+            PolicyBinding.objects.create(policy=flow_policy, target=fsb, order=0)
+
+            exporter = FlowExporter(flow)
+            export_yaml = exporter.export_to_string()
+
+        binding_pks = []
+
+        def capture_binding_pk(sender, instance, **kwargs):
+            binding_pks.append(instance.policy_binding_uuid)
+
+        # Inspect the signal instance: reloading from the database would hide a string UUID.
+        post_save.connect(capture_binding_pk, sender=PolicyBinding)
+        try:
+            importer = Importer.from_string(export_yaml)
+            self.assertTrue(importer.validate()[0])
+            self.assertTrue(importer.apply())
+        finally:
+            post_save.disconnect(capture_binding_pk, sender=PolicyBinding)
+
+        self.assertTrue(binding_pks)
+        for binding_pk in binding_pks:
+            self.assertIsInstance(binding_pk, UUID)
+        self.assertTrue(UserLoginStage.objects.filter(name=stage_name).exists())
+        self.assertTrue(Flow.objects.filter(slug=flow_slug).exists())
+
+    def test_export_uses_keyof_references(self):
+        """Test that exporting a flow rewrites references between exported objects
+        as !KeyOf tags instead of raw primary keys"""
+        flow_slug = generate_id()
+        stage_name = generate_id()
+        policy_name = generate_id()
+        with transaction_rollback():
+            flow_policy = ExpressionPolicy.objects.create(
+                name=policy_name,
+                expression="return True",
+            )
+            flow = Flow.objects.create(
+                slug=flow_slug,
+                designation=FlowDesignation.AUTHENTICATION,
+                name=generate_id(),
+                title=generate_id(),
+            )
+            PolicyBinding.objects.create(policy=flow_policy, target=flow, order=0)
+
+            user_login = UserLoginStage.objects.create(name=stage_name)
+            fsb = FlowStageBinding.objects.create(target=flow, stage=user_login, order=0)
+            PolicyBinding.objects.create(policy=flow_policy, target=fsb, order=0)
+
+            exporter = FlowExporter(flow)
+            export = exporter.export()
+            export_yaml = exporter.export_to_string()
+
+        entries_by_model = {}
+        for entry in export.entries:
+            entries_by_model.setdefault(entry.model, []).append(entry)
+
+        flow_entry = entries_by_model["authentik_flows.flow"][0]
+        stage_entry = entries_by_model["authentik_stages_user_login.userloginstage"][0]
+        stage_binding_entry = entries_by_model["authentik_flows.flowstagebinding"][0]
+        policy_entry = entries_by_model["authentik_policies_expression.expressionpolicy"][0]
+        policy_binding_entries = entries_by_model["authentik_policies.policybinding"]
+
+        self.assertIsNotNone(flow_entry.id)
+        self.assertIsNotNone(stage_entry.id)
+        # ids are derived from a readable, unique, non-UUID field (slug/name) when available,
+        # rather than an opaque counter
+        self.assertEqual(flow_entry.id, f"flow-{slugify(flow_slug)}")
+        self.assertEqual(stage_entry.id, f"userloginstage-{slugify(stage_name)}")
+
+        # Policy is exported without any explicit extra identifiers, but its unique,
+        # non-UUID `name` field is still picked up automatically as a stable identifier
+        self.assertEqual(policy_entry.identifiers.get("name"), policy_name)
+        # The primary key is instance-local and not portable, so it must not be used as
+        # an identifier whenever a stable identifier could be found instead
+        for entry in (flow_entry, stage_entry, policy_entry):
+            self.assertNotIn("pk", entry.identifiers)
+
+        self.assertIsInstance(stage_binding_entry.identifiers["target"], KeyOf)
+        self.assertEqual(stage_binding_entry.identifiers["target"].id_from, flow_entry.id)
+        self.assertIsInstance(stage_binding_entry.identifiers["stage"], KeyOf)
+        self.assertEqual(stage_binding_entry.identifiers["stage"].id_from, stage_entry.id)
+
+        binding_targets = {pb.identifiers["target"].id_from for pb in policy_binding_entries}
+        self.assertIn(flow_entry.id, binding_targets)
+        self.assertIn(stage_binding_entry.id, binding_targets)
+        for policy_binding_entry in policy_binding_entries:
+            self.assertIsInstance(policy_binding_entry.identifiers["policy"], KeyOf)
+            self.assertEqual(policy_binding_entry.identifiers["policy"].id_from, policy_entry.id)
+
+        self.assertIn("!KeyOf", export_yaml)
+
+        importer = Importer.from_string(export_yaml)
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())
+        self.assertTrue(Flow.objects.filter(slug=flow_slug).exists())
+
+    def test_export_default_blueprints_no_static_identifiers(self):
+        """Test that exporting a full instance after applying all default blueprints
+        never falls back to an opaque, non-portable `pk` identifier, e.g. for models
+        such as FlowStageBinding that have no unique text field of their own"""
+        for blueprint_file in sorted(Path("blueprints/default").glob("*.yaml")):
+            rel_path = str(blueprint_file.relative_to("blueprints"))
+            importer = Importer.from_string(BlueprintInstance(path=rel_path).retrieve())
+            self.assertTrue(importer.validate()[0])
+            self.assertTrue(importer.apply())
+
+        export = Exporter().export()
+        for entry in export.entries:
+            self.assertNotIn(
+                "pk", entry.identifiers, f"{entry.model} entry has a static pk identifier"
+            )
+
+    def test_export_validate_import_prompt(self):
+        """Test export and validate it"""
+        with transaction_rollback():
+            # First stage fields
+            username_prompt = Prompt.objects.create(
+                name=generate_id(),
+                field_key="username",
+                label="Username",
+                order=0,
+                type=FieldTypes.TEXT,
+            )
+            password = Prompt.objects.create(
+                name=generate_id(),
+                field_key="password",
+                label="Password",
+                order=1,
+                type=FieldTypes.PASSWORD,
+            )
+            password_repeat = Prompt.objects.create(
+                name=generate_id(),
+                field_key="password_repeat",
+                label="Password (repeat)",
+                order=2,
+                type=FieldTypes.PASSWORD,
+            )
+
+            # Stages
+            first_stage = PromptStage.objects.create(name=generate_id())
+            first_stage.fields.set([username_prompt, password, password_repeat])
+            first_stage.save()
+
+            flow = Flow.objects.create(
+                name=generate_id(),
+                slug=generate_id(),
+                designation=FlowDesignation.ENROLLMENT,
+                title=generate_id(),
+            )
+
+            FlowStageBinding.objects.create(target=flow, stage=first_stage, order=0)
+
+            exporter = FlowExporter(flow)
+            export_yaml = exporter.export_to_string()
+
+        importer = Importer.from_string(export_yaml)
+
+        self.assertTrue(importer.validate()[0])
+        self.assertTrue(importer.apply())

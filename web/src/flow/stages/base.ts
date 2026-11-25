@@ -1,0 +1,207 @@
+import "#flow/FormStatic";
+import { pluckErrorDetail } from "#common/errors/network";
+
+import { AKElement } from "#elements/Base";
+import { intersectionObserver } from "#elements/decorators/intersection-observer";
+import { WithLocale } from "#elements/mixins/locale";
+import { findEmptyFocusCandidate, FocusTarget } from "#elements/utils/focus";
+
+import { FlowUserDetails } from "#flow/FormStatic";
+import { IBaseStage, isFormStaticChallengeLike, StageChallengeLike, StageHost } from "#flow/types";
+
+import { ConsoleLogger } from "#logger/browser";
+
+import { FlowErrorChallenge } from "@goauthentik/api";
+
+import { html, PropertyValues } from "lit";
+import { property } from "lit/decorators.js";
+
+export function readFileAsync(file: Blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => {
+            resolve(reader.result);
+        };
+
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
+// Challenge which has a pending user
+
+/**
+ * Base class for all flow stages.
+ *
+ * @template Tin The type of the challenge this stage accepts.
+ * @property {StageHost} host The host managing this stage.
+ * @property {Tin} challenge The challenge provided to this stage.
+ */
+export abstract class BaseStage<Tin extends StageChallengeLike | FlowErrorChallenge, Tout = unknown>
+    extends WithLocale(AKElement)
+    implements IBaseStage<Tin, Tout>
+{
+    static shadowRootOptions: ShadowRootInit = {
+        ...AKElement.shadowRootOptions,
+        delegatesFocus: true,
+    };
+
+    protected logger = ConsoleLogger.prefix(`flow:${this.localName}`);
+
+    @property({ type: Object, attribute: false })
+    public host!: StageHost;
+
+    @property({ attribute: false })
+    public challenge: Tin | null = null;
+
+    @intersectionObserver()
+    public visible = false;
+
+    protected primaryFocusTarget = new FocusTarget<HTMLInputElement>();
+    protected secondaryFocusTarget = new FocusTarget<HTMLInputElement>();
+
+    public override focus = (): void => {
+        const focusTarget = findEmptyFocusCandidate(
+            this.primaryFocusTarget.target,
+            this.secondaryFocusTarget.target,
+        );
+
+        if (!focusTarget) {
+            this.logger.info("Skipping focus. No empty candidate.");
+
+            return;
+        }
+
+        this.logger.info("Attempting to focus");
+        focusTarget.focus();
+    };
+
+    #visibilityListener = () => {
+        if (document.visibilityState !== "visible") return;
+
+        if (!this.visible) return;
+
+        this.focus();
+    };
+
+    public override connectedCallback(): void {
+        super.connectedCallback();
+
+        this.addEventListener("focus", this.focus);
+
+        document.addEventListener("visibilitychange", this.#visibilityListener);
+    }
+
+    public override disconnectedCallback(): void {
+        super.disconnectedCallback();
+
+        this.removeEventListener("focus", this.focus);
+
+        document.removeEventListener("visibilitychange", this.#visibilityListener);
+    }
+
+    protected override updated(changed: PropertyValues<this>): void {
+        super.updated(changed);
+
+        // We're especially mindful of how often this runs to avoid
+        // unnecessary focus and in-fighting between the user's chosen focus target.
+        if (changed.has("visible") && changed.get("visible") !== this.visible && this.visible) {
+            requestAnimationFrame(() => {
+                this.focus();
+            });
+        }
+    }
+
+    public submitForm = async (event?: SubmitEvent, defaults?: Tout): Promise<boolean> => {
+        event?.preventDefault();
+
+        const payload: Record<string, unknown> = defaults || {};
+
+        const form = this.shadowRoot?.querySelector("form") ?? this.querySelector("form");
+
+        if (form) {
+            const data = new FormData(form);
+
+            for await (const [key, value] of data.entries()) {
+                if (value instanceof Blob) {
+                    payload[key] = await readFileAsync(value);
+                } else {
+                    payload[key] = value;
+                }
+            }
+        }
+
+        return this.host?.submit(payload).then(async (successful) => {
+            if (successful) {
+                await this.onSubmitSuccess?.(payload);
+            } else {
+                await this.onSubmitFailure?.(payload);
+            }
+
+            return successful;
+        });
+    };
+
+    protected renderNonFieldErrors() {
+        const nonFieldErrors = this.challenge?.responseErrors?.non_field_errors;
+
+        if (!nonFieldErrors) {
+            return null;
+        }
+
+        return html`<div class="pf-c-form__alert">
+            ${nonFieldErrors.map((err, idx) => {
+                return html`<div
+                    role="alert"
+                    aria-labelledby="error-message-${idx}"
+                    class="pf-c-alert pf-m-inline pf-m-danger"
+                >
+                    <div class="pf-c-alert__icon">
+                        <i aria-hidden="true" class="fas fa-exclamation-circle"></i>
+                    </div>
+                    <p id="error-message-${idx}" class="pf-c-alert__title">
+                        ${pluckErrorDetail(err)}
+                    </p>
+                </div>`;
+            })}
+        </div>`;
+    }
+
+    /**
+     * Renders the user information section of the form, if applicable.
+     */
+    protected renderUserInfo() {
+        const { challenge } = this;
+
+        // Do we have a challenge that isn't shaped like an error?
+        if (!isFormStaticChallengeLike(challenge)) return null;
+
+        // And do we have a pending user or avatar to display?
+        if (!challenge.pendingUser && !challenge.pendingUserAvatar) {
+            return null;
+        }
+
+        return html`${FlowUserDetails({ challenge })}
+            <input
+                name="username"
+                autocomplete="username"
+                type="hidden"
+                value="${challenge.pendingUser}"
+            />`;
+    }
+
+    /**
+     * Callback method for successful form submission.
+     *
+     * @abstract
+     */
+    protected onSubmitSuccess?(payload: Record<string, unknown>): void | Promise<void>;
+
+    /**
+     * Callback method for failed form submission.
+     *
+     * @abstract
+     */
+    protected onSubmitFailure?(payload: Record<string, unknown>): void | Promise<void>;
+}

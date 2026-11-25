@@ -1,0 +1,170 @@
+import type { Config as DOMPurifyConfig } from "dompurify";
+import DOMPurify from "dompurify";
+import { trustedTypes } from "trusted-types";
+
+import { render } from "lit";
+import { unsafeHTML } from "lit/directives/unsafe-html.js";
+
+/**
+ * Trusted types policy that escapes HTML content in place.
+ *
+ * @returns {TrustedHTML} All HTML content, escaped.
+ * @see {@linkcode SanitizedTrustPolicy} to strip HTML content.
+ */
+export const EscapeTrustPolicy = trustedTypes.createPolicy("authentik-escape", {
+    createHTML: (untrustedHTML: string) => {
+        return DOMPurify.sanitize(untrustedHTML, {
+            RETURN_TRUSTED_TYPE: false,
+        });
+    },
+});
+
+/**
+ * Trusted types policy that removes all HTML content.
+ *
+ * @returns {TrustedHTML} All remaining text content.
+ */
+export const StripHTMLTrustPolicy = trustedTypes.createPolicy("authentik-strip-html", {
+    createHTML: (untrustedHTML: string) => {
+        return DOMPurify.sanitize(untrustedHTML, {
+            RETURN_TRUSTED_TYPE: false,
+            ALLOWED_TAGS: [],
+            ALLOWED_ATTR: [],
+        });
+    },
+});
+
+/**
+ * Trusted types policy, stripping all HTML content.
+ *
+ * @returns {TrustedHTML} Text content only, all HTML tags stripped.
+ */
+export const SanitizedTrustPolicy = trustedTypes.createPolicy("authentik-sanitize", {
+    createHTML: (untrustedHTML: string) => {
+        return DOMPurify.sanitize(untrustedHTML, {
+            RETURN_TRUSTED_TYPE: false,
+            ALLOWED_TAGS: ["#text"],
+        });
+    },
+});
+
+/**
+ * Trusted types policy for HTML produced by our build-time markdown
+ * pipeline (`mdx-plugin`) and stamped into `<ak-mdx>` in URL mode.
+ *
+ * The compiled HTML originates from source we own, but `<ak-mdx>` exposes
+ * a `replacers` hook that lets consumers splice dynamic — and sometimes
+ * admin-controlled — values into it before render (e.g. a proxy
+ * provider's `externalHost` in `ProxyProviderViewPage`). Once a replacer
+ * has run, "we own every byte" no longer holds, so we re-sanitize here
+ * rather than passing the string through untouched.
+ *
+ * DOMPurify's default tag list would strip the custom elements our
+ * pipeline emits (`<ak-alert>`, `<ak-md-a>`, `<ak-diagram>`) along with
+ * the `part`/`level` attributes they rely on, so those are explicitly
+ * allowed. `target` is allowed for the same reason: `rehypeAnchors` opens
+ * external and cross-doc links in a new tab, and without it the attribute
+ * is dropped while the paired `rel` survives. Every browser we support
+ * implies `rel="noopener"` for `target="_blank"` regardless, so a replacer
+ * that injects a bare `target` cannot reach the opener. Everything else —
+ * script handlers, unknown elements, unsafe URLs injected via a replacer —
+ * is still removed.
+ */
+export const CompiledMarkdownSanitizePolicy = trustedTypes.createPolicy("authentik-markdown", {
+    createHTML: (untrustedHTML: string) => {
+        return DOMPurify.sanitize(untrustedHTML, {
+            RETURN_TRUSTED_TYPE: false,
+            ADD_TAGS: ["ak-alert", "ak-md-a", "ak-diagram"],
+            ADD_ATTR: ["part", "level", "target"],
+        });
+    },
+});
+
+/**
+ * Trusted types policy, allowing a minimal set of _safe_ HTML tags supplied by
+ * a trusted source, such as the brand API.
+ */
+export const BrandedHTMLPolicy = trustedTypes.createPolicy("authentik-restrict", {
+    createHTML: (untrustedHTML: string) => {
+        return DOMPurify.sanitize(untrustedHTML, {
+            RETURN_TRUSTED_TYPE: false,
+            FORBID_TAGS: [
+                "script",
+                "style",
+                "iframe",
+                "link",
+                "object",
+                "embed",
+                "applet",
+                "meta",
+                "base",
+                "form",
+                "input",
+                "textarea",
+                "select",
+                "button",
+            ],
+            FORBID_ATTR: [
+                "onerror",
+                "onclick",
+                "onload",
+                "onmouseover",
+                "onmouseout",
+                "onmouseup",
+                "onmousedown",
+                "onfocus",
+                "onblur",
+                "onsubmit",
+            ],
+        });
+    },
+});
+
+export type AuthentikTrustPolicy =
+    | typeof EscapeTrustPolicy
+    | typeof SanitizedTrustPolicy
+    | typeof BrandedHTMLPolicy;
+
+/**
+ * Sanitize an untrusted HTML string using a trusted types policy.
+ */
+export function sanitizeHTML(trustPolicy: AuthentikTrustPolicy, untrustedHTML: string) {
+    return unsafeHTML(trustPolicy.createHTML(untrustedHTML).toString());
+}
+
+/**
+ * DOMPurify configuration for strict sanitization.
+ *
+ * This configuration only allows text nodes and disallows all HTML tags.
+ */
+export const DOM_PURIFY_STRICT = {
+    ALLOWED_TAGS: ["#text"],
+} as const satisfies DOMPurifyConfig;
+
+/**
+ * DOMPurify configuration for relaxed sanitization.
+ *
+ * This configuration allows text nodes and <br> tags.
+ */
+export const DOM_PURIFY_RELAXED = {
+    ALLOWED_TAGS: ["#text", "br", "div", "strong"],
+    ALLOWED_ATTR: ["class"],
+} as const satisfies DOMPurifyConfig;
+
+/**
+ * Render untrusted HTML to a string without escaping it.
+ *
+ * @returns {string} The rendered HTML string.
+ */
+export function renderStaticHTMLUnsafe(untrustedHTML: unknown): string {
+    const container = document.createElement("html");
+
+    render(untrustedHTML, container);
+
+    const result = container.innerHTML
+        // Remove all comments as they can interfere with the styles.
+        .replaceAll("<!---->", "")
+        .replaceAll(/<!--\?lit\$\d+\$-->/g, "");
+
+    return result;
+}

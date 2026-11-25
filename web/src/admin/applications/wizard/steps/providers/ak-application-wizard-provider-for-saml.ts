@@ -1,0 +1,128 @@
+import "#elements/forms/FormGroup";
+import type { SearchSelectChangeEvent } from "#elements/forms/SearchSelect/events";
+
+import { ApplicationWizardProviderForm } from "#admin/applications/wizard/steps/providers/ApplicationWizardProviderForm";
+import { renderForm } from "#admin/providers/saml/SAMLProviderFormForm";
+
+import {
+    KeyTypeEnum,
+    SAMLBindingsEnum,
+    SAMLLogoutMethods,
+    SAMLProvider,
+    CertificateKeyPair,
+} from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { customElement, state } from "@lit/reactive-element/decorators.js";
+import { html } from "lit";
+
+@customElement("ak-application-wizard-provider-for-saml")
+export class ApplicationWizardProviderSamlForm extends ApplicationWizardProviderForm<SAMLProvider> {
+    label = msg("Configure SAML Provider");
+
+    @state()
+    protected hasSigningKp = false;
+
+    @state()
+    protected hasEncryptionKp = false;
+
+    @state()
+    protected hasSlsUrl = false;
+
+    @state()
+    protected hasPostBinding = false;
+
+    @state()
+    protected logoutMethod: string = SAMLLogoutMethods.FrontchannelIframe;
+
+    @state()
+    protected signingKeyType: KeyTypeEnum | null = null;
+
+    get formValues() {
+        const values = super.formValues;
+
+        // If SLS binding is redirect, ensure logout method is not backchannel
+        if (
+            values.slsBinding === SAMLBindingsEnum.Redirect &&
+            values.logoutMethod === SAMLLogoutMethods.Backchannel
+        ) {
+            return {
+                ...values,
+                logoutMethod: SAMLLogoutMethods.FrontchannelIframe,
+            };
+        }
+
+        return values;
+    }
+
+    renderForm() {
+        const setHasSigningKp = ({ detail }: SearchSelectChangeEvent<CertificateKeyPair>) => {
+            this.hasSigningKp = !!detail.value;
+            this.signingKeyType = detail.value?.keyType ?? KeyTypeEnum.Rsa;
+        };
+
+        const setHasEncryptionKp = ({ detail }: SearchSelectChangeEvent<CertificateKeyPair>) => {
+            this.hasEncryptionKp = !!detail.value;
+        };
+
+        const setHasSlsUrl = (ev: Event) => {
+            const akTextInput = ev.currentTarget as HTMLElement & { value?: string };
+
+            if (!akTextInput) return;
+
+            const value = akTextInput.value || "";
+            this.hasSlsUrl = !!value;
+        };
+
+        const setSlsBinding = (ev: Event) => {
+            const target = ev.target as HTMLInputElement;
+            this.hasPostBinding = target.value === SAMLBindingsEnum.Post;
+
+            // If switching to redirect binding, change logout method from backchannel if needed
+            if (
+                target.value === SAMLBindingsEnum.Redirect &&
+                this.logoutMethod === SAMLLogoutMethods.Backchannel
+            ) {
+                this.logoutMethod = SAMLLogoutMethods.FrontchannelIframe;
+            }
+        };
+
+        const setLogoutMethod = (ev: Event) => {
+            const target = ev.target as HTMLInputElement;
+            this.logoutMethod = target.value;
+        };
+
+        return html`<h3 class="pf-c-wizard__main-title">${this.label}</h3>
+            <form id="providerform" class="pf-c-form pf-m-horizontal" slot="form">
+                ${renderForm({
+                    provider: this.wizard.provider,
+                    errors: this.wizard.errors?.provider,
+                    setHasSigningKp,
+                    hasSigningKp: this.hasSigningKp,
+                    signingKeyType: this.signingKeyType,
+                    setHasEncryptionKp,
+                    hasEncryptionKp: this.hasEncryptionKp,
+                    setHasSlsUrl,
+                    hasSlsUrl: this.hasSlsUrl,
+                    setSlsBinding,
+                    hasPostBinding: this.hasPostBinding,
+                    logoutMethod: this.logoutMethod,
+                    setLogoutMethod,
+                })}
+            </form>`;
+    }
+
+    render() {
+        if (!(this.wizard.provider && this.wizard.errors)) {
+            throw new Error("SAML Provider Step received uninitialized wizard context.");
+        }
+
+        return this.renderForm();
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-application-wizard-provider-for-saml": ApplicationWizardProviderSamlForm;
+    }
+}

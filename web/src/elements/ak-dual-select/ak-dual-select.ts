@@ -1,0 +1,454 @@
+import "./components/ak-dual-select-available-pane.js";
+import "./components/ak-dual-select-controls.js";
+import "./components/ak-dual-select-selected-pane.js";
+import "#elements/Paginator";
+import { AkDualSelectAvailablePane } from "./components/ak-dual-select-available-pane.js";
+import { AkDualSelectSelectedPane } from "./components/ak-dual-select-selected-pane.js";
+import "./components/ak-search-bar.js";
+
+import { globalVariables, mainStyles } from "./components/styles.js";
+import { DualSelectEvent, SearchbarEvent } from "./events.js";
+import { DualSelectEventType, DualSelectPair, SearchbarEventSource } from "./types.js";
+import PFButton from "@patternfly/patternfly/components/Button/button.css";
+
+import { plural } from "#common/ui/locale/plurals";
+
+import { AKElement } from "#elements/Base";
+import { pageBounds } from "#elements/Paginator";
+
+import { match } from "ts-pattern";
+
+import { msg, str } from "@lit/localize";
+import { html, nothing, PropertyValues } from "lit";
+import { customElement, property, state } from "lit/decorators.js";
+import type { Ref } from "lit/directives/ref.js";
+import { createRef, ref } from "lit/directives/ref.js";
+import { unsafeHTML } from "lit/directives/unsafe-html.js";
+
+function localeComparator(a: DualSelectPair, b: DualSelectPair) {
+    const aSortBy = String(a[2] || a[0]);
+    const bSortBy = String(b[2] || b[0]);
+
+    return aSortBy.localeCompare(bSortBy);
+}
+
+function keyfinder(key: string | number) {
+    return ([k]: DualSelectPair) => k === key;
+}
+
+const DelegatedEvents = [
+    DualSelectEventType.AddSelected,
+    DualSelectEventType.RemoveSelected,
+    DualSelectEventType.AddAll,
+    DualSelectEventType.RemoveAll,
+    DualSelectEventType.DeleteAll,
+    DualSelectEventType.AddOne,
+    DualSelectEventType.RemoveOne,
+] as const satisfies DualSelectEventType[];
+
+/**
+ * @fires ak-dual-select-change - A custom change event with the current `selected` list.
+ * @element ak-dual-select
+ *
+ * A master (but independent) component that shows two lists-- one of "available options" and one of
+ * "selected options".  The Available Options panel supports pagination if it receives a valid and
+ * active pagination object (based on Django's pagination object) from the invoking component.
+ */
+@customElement("ak-dual-select")
+export class AkDualSelect extends AKElement {
+    static styles = [PFButton, globalVariables, mainStyles];
+
+    //#region Properties
+
+    /**
+     * The list of options to _currently_ show.
+     *
+     * Note that this is not *all* the options,
+     * only the currently shown list of options from a pagination collection.
+     */
+    @property({ type: Array })
+    options: DualSelectPair[] = [];
+
+    /**
+     * The list of options selected.
+     * This is the *entire* list and will not be paginated.
+     */
+    @property({ type: Array })
+    selected: DualSelectPair[] = [];
+
+    @property({ type: Number, attribute: "item-count" })
+    itemCount = 0;
+
+    @property({ type: Number, attribute: "items-per-page" })
+    itemsPerPage = 20;
+
+    @property({ type: Number })
+    page = 1;
+
+    @property({ attribute: "available-label" })
+    availableLabel = msg("Available options");
+
+    @property({ attribute: "selected-label" })
+    selectedLabel = msg("Selected options");
+
+    @property({ type: Boolean, attribute: "no-search" })
+    noSearch = false;
+
+    @property({ type: Boolean, attribute: "no-status" })
+    noStatus = false;
+
+    /**
+     * When true, the selected pane preserves insertion order instead of sorting alphabetically.
+     * Use this when the order of selected items is meaningful (e.g. priority-based lists).
+     */
+    @property({ type: Boolean, attribute: "preserve-order" })
+    preserveOrder = false;
+
+    //#endregion
+
+    //#region State
+
+    @state()
+    protected selectedFilter: string = "";
+
+    #selectedKeys: Set<string | number> = new Set();
+
+    //#endregion
+
+    //#region Refs
+
+    availablePane: Ref<AkDualSelectAvailablePane> = createRef();
+
+    selectedPane: Ref<AkDualSelectSelectedPane> = createRef();
+
+    //#endregion
+
+    //#region Lifecycle
+
+    constructor() {
+        super();
+
+        for (const eventName of DelegatedEvents) {
+            this.addEventListener(eventName, this.#moveListener);
+        }
+
+        this.addEventListener(DualSelectEventType.Move, () => {
+            this.requestUpdate();
+        });
+
+        this.addEventListener(SearchbarEvent.eventName, this.#searchListener);
+    }
+
+    willUpdate(changedProperties: PropertyValues<this>) {
+        if (changedProperties.has("selected")) {
+            this.#selectedKeys = new Set(this.selected.map(([key]) => key));
+        }
+
+        // Pagination invalidates available moveables.
+        if (changedProperties.has("options") && this.availablePane.value) {
+            this.availablePane.value.clearMove();
+        }
+    }
+
+    //#endregion
+
+    //#region Event Listeners
+
+    #moveListener = (event: DualSelectEvent<(typeof DelegatedEvents)[number]>) => {
+        const key = event.detail;
+
+        match(event.type)
+            .with(DualSelectEventType.AddSelected, () => this.addSelected())
+            .with(DualSelectEventType.RemoveSelected, () => this.removeSelected())
+            .with(DualSelectEventType.AddAll, () => this.addAllVisible())
+            .with(DualSelectEventType.RemoveAll, () => this.removeAllVisible())
+            .with(DualSelectEventType.DeleteAll, () => this.removeAll())
+            .with(DualSelectEventType.AddOne, () => key !== undefined && this.addOne(key))
+            .with(DualSelectEventType.RemoveOne, () => key !== undefined && this.removeOne(key))
+            .otherwise(() => {
+                throw new Error(`Expected move event here, got ${event.type}`);
+            });
+
+        this.dispatchEvent(new DualSelectEvent(DualSelectEventType.Change, { value: this.value }));
+
+        event.stopPropagation();
+    };
+
+    protected addSelected() {
+        if (this.availablePane.value!.moveable.length === 0) return;
+
+        this.selected = this.availablePane.value!.moveable.reduce(
+            (acc, key) => {
+                const value = this.options.find(keyfinder(key));
+
+                return value && !acc.find(keyfinder(value[0])) ? [...acc, value] : acc;
+            },
+            [...this.selected],
+        );
+
+        // This is where the information gets... lossy.  Dammit.
+        this.availablePane.value!.clearMove();
+    }
+
+    protected addOne(key: string | number) {
+        const requested = this.options.find(keyfinder(key));
+
+        if (!requested) return;
+
+        if (this.selected.find(keyfinder(requested[0]))) return;
+
+        this.selected = [...this.selected, requested];
+    }
+
+    // These are the *currently visible* options; the parent node is responsible for paginating and
+    // updating the list of currently visible options;
+    protected addAllVisible() {
+        // Create a new array of all current options and selected, and de-dupe.
+        const selected = new Map<string | number, DualSelectPair>([
+            ...this.options.map((pair) => [pair[0], pair] as const),
+            ...this.selected.map((pair) => [pair[0], pair] as const),
+        ]);
+
+        this.selected = Array.from(selected.values());
+
+        this.availablePane.value!.clearMove();
+    }
+
+    protected removeSelected() {
+        if (this.selectedPane.value!.moveable.length === 0) return;
+
+        const deselected = new Set(this.selectedPane.value!.moveable);
+
+        this.selected = this.selected.filter(([key]) => !deselected.has(key));
+
+        this.selectedPane.value!.clearMove();
+    }
+
+    protected removeOne(key: string | number) {
+        this.selected = this.selected.filter(([k]) => k !== key);
+    }
+
+    protected removeAllVisible() {
+        // Remove all the items from selected that are in the *currently visible* options list
+        const options = new Set(this.options.map(([k]) => k));
+
+        this.selected = this.selected.filter(([k]) => !options.has(k));
+
+        this.selectedPane.value!.clearMove();
+    }
+
+    removeAll() {
+        this.selected = [];
+        this.selectedPane.value!.clearMove();
+    }
+
+    #searchListener = (event: SearchbarEvent) => {
+        const { source, value } = event.detail;
+
+        match(source)
+            .with(SearchbarEventSource.Available, () => {
+                this.dispatchEvent(new DualSelectEvent(DualSelectEventType.Search, value));
+            })
+            .with(SearchbarEventSource.Selected, () => {
+                this.selectedFilter = value;
+                this.selectedPane.value!.clearMove();
+            })
+            .exhaustive();
+
+        event.stopPropagation();
+    };
+
+    //#endregion
+
+    //#region Public Getters
+
+    get value() {
+        return this.selected;
+    }
+
+    get canAddAll() {
+        // False unless any visible option cannot be found in the selected list, so can still be
+        // added.
+        const allMoved =
+            this.options.length ===
+            this.options.filter(([key, _]) => this.#selectedKeys.has(key)).length;
+
+        return this.options.length > 0 && !allMoved;
+    }
+
+    get canRemoveAll() {
+        // False if no visible option can be found in the selected list
+        return (
+            this.options.length > 0 &&
+            !!this.options.find(([key, _]) => this.#selectedKeys.has(key))
+        );
+    }
+
+    get needPagination() {
+        return pageBounds(this.itemCount, this.itemsPerPage, this.page).totalPages > 1;
+    }
+
+    //#endregion
+
+    //#region Render
+
+    render() {
+        const selected =
+            this.selectedFilter === ""
+                ? this.selected
+                : this.selected.filter(([_k, v, s]) => {
+                      const value = s !== undefined ? s : v;
+
+                      if (typeof value !== "string") {
+                          throw new Error("Filter only works when there's a string comparator");
+                      }
+
+                      return value.toLowerCase().includes(this.selectedFilter.toLowerCase());
+                  });
+
+        const availableCount = this.availablePane.value?.toMove.size ?? 0;
+        const selectedCount = this.selectedPane.value?.toMove.size ?? 0;
+        const selectedTotal = selected.length;
+
+        const availableStatus =
+            availableCount > 0
+                ? plural(availableCount, {
+                      one: (formattedCount) =>
+                          msg(str`${formattedCount} item marked to add.`, {
+                              id: "dual-select.status.marked-to-add.one",
+                          }),
+                      other: (formattedCount) =>
+                          msg(str`${formattedCount} items marked to add.`, {
+                              id: "dual-select.status.marked-to-add.other",
+                          }),
+                  })
+                : "&nbsp;";
+
+        const selectedTotalStatus = plural(selectedTotal, {
+            one: (formattedCount) =>
+                msg(str`${formattedCount} item selected.`, {
+                    id: "dual-select.status.selected.one",
+                }),
+            other: (formattedCount) =>
+                msg(str`${formattedCount} items selected.`, {
+                    id: "dual-select.status.selected.other",
+                }),
+        });
+
+        const selectedCountStatus = plural(selectedCount, {
+            one: (formattedCount) =>
+                msg(str`${formattedCount} item marked to remove.`, {
+                    id: "dual-select.status.marked-to-remove.one",
+                }),
+            other: (formattedCount) =>
+                msg(str`${formattedCount} items marked to remove.`, {
+                    id: "dual-select.status.marked-to-remove.other",
+                }),
+        });
+
+        const selectedStatus =
+            selectedCount > 0
+                ? `${selectedTotalStatus} ${selectedCountStatus}`
+                : selectedTotalStatus;
+
+        return html`
+            <div class="ak-dual-list-selector">
+                <div class="ak-available-pane">
+                    <div class="pf-c-dual-list-selector__header">
+                        <div class="pf-c-dual-list-selector__title">
+                            <div class="pf-c-dual-list-selector__title-text">
+                                ${this.availableLabel}
+                            </div>
+                        </div>
+                    </div>
+                    ${
+                        this.noSearch
+                            ? nothing
+                            : html`<ak-search-bar
+                                  placeholder=${msg(str`Search ${this.availableLabel}...`)}
+                                  name="ak-dual-list-available-search"
+                              ></ak-search-bar>`
+                    }
+                    ${
+                        this.noStatus
+                            ? nothing
+                            : html`<div class="pf-c-dual-list-selector__status">
+                                  <span
+                                      class="pf-c-dual-list-selector__status-text"
+                                      id="basic-available-status-text"
+                                      >${unsafeHTML(availableStatus)}</span
+                                  >
+                              </div>`
+                    }
+                    <ak-dual-select-available-pane
+                        ${ref(this.availablePane)}
+                        .options=${this.options}
+                        .selected=${this.#selectedKeys}
+                    ></ak-dual-select-available-pane>
+                    ${
+                        this.needPagination
+                            ? html`<ak-paginator
+                                  compact
+                                  item-count=${this.itemCount}
+                                  items-per-page=${this.itemsPerPage}
+                                  page=${this.page}
+                              ></ak-paginator>`
+                            : nothing
+                    }
+                </div>
+                <ak-dual-select-controls
+                    ?add-active=${(this.availablePane.value?.moveable.length ?? 0) > 0}
+                    ?remove-active=${(this.selectedPane.value?.moveable.length ?? 0) > 0}
+                    ?add-all-active=${this.canAddAll}
+                    ?remove-all-active=${this.canRemoveAll}
+                    ?delete-all-active=${this.selected.length !== 0}
+                    enable-select-all
+                    enable-delete-all
+                ></ak-dual-select-controls>
+                <div class="ak-selected-pane">
+                    <div class="pf-c-dual-list-selector__header">
+                        <div class="pf-c-dual-list-selector__title">
+                            <div class="pf-c-dual-list-selector__title-text">
+                                ${this.selectedLabel}
+                            </div>
+                        </div>
+                    </div>
+                    ${
+                        this.noSearch
+                            ? nothing
+                            : html`<ak-search-bar
+                                  placeholder=${msg(str`Search ${this.selectedLabel}...`)}
+                                  name="ak-dual-list-selected-search"
+                              ></ak-search-bar>`
+                    }
+                    ${
+                        this.noStatus
+                            ? nothing
+                            : html`<div
+                                  class="pf-c-dual-list-selector__status ak-dual-list-selector__status--selected"
+                              >
+                                  <span class="pf-c-dual-list-selector__status-text"
+                                      >${selectedStatus}</span
+                                  >
+                              </div>`
+                    }
+
+                    <ak-dual-select-selected-pane
+                        ${ref(this.selectedPane)}
+                        .selected=${
+                            this.preserveOrder ? selected : selected.toSorted(localeComparator)
+                        }
+                    ></ak-dual-select-selected-pane>
+                </div>
+            </div>
+        `;
+    }
+
+    //#endregion
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-dual-select": AkDualSelect;
+    }
+}

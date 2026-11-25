@@ -1,0 +1,49 @@
+{
+    "name": "@goauthentik/api",
+    "version": "0.0.0",
+    "description": "OpenAPI client for @goauthentik/api",
+    "author": "OpenAPI-Generator",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/goauthentik/authentik.git"
+    },
+    "type": "module",
+    "sideEffects": false,
+    "main": "./src/index.ts",
+    "module": "./src/index.ts",
+    "types": "./src/index.ts",
+    "scripts": {
+        "build": "pnpm run clean && tsc -b tsconfig.json",
+        "check": "run-s lint:check format:check",
+        "clean": "tsc -b --clean tsconfig.json",
+        "fix": "run-s lint format",
+        "format": "oxfmt --write .",
+        "format:check": "oxfmt --check .",
+        "lint": "oxlint --fix --quiet && oxlint --fix --quiet",
+        "lint:check": "oxlint --max-warnings=0",
+        "post-process": "node ./scripts/post-process.ts",
+        "prepare": "pnpm run build"
+    },
+    "devDependencies": {
+        "@goauthentik/oxfmt-config": "link:../oxfmt-config",
+        "@goauthentik/oxlint-config": "link:../oxlint-config",
+        "@goauthentik/tsconfig": "link:../tsconfig",
+        "@types/node": "catalog:",
+        "npm-run-all": "^4.1.5",
+        "oxfmt": "catalog:",
+        "oxlint": "catalog:",
+        "typescript": "catalog:"
+    },
+    "devEngines": {
+        "runtime": {
+            "name": "node",
+            "version": ">=24.20",
+            "onFail": "error"
+        }
+    },
+    "engines": {
+        "node": ">=24",
+        "pnpm": ">=12.4.0"
+    },
+    "packageManager": "pnpm@12.23.0+sha512.02da94ffaf133f46074322afe552f90d40b5f71ae259aefbccdacc5085b1d617e98d65e0131f5748b9b67445978ee5055d7d59a473f1eef0d504854fefcd5975"
+}

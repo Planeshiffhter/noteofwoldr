@@ -1,0 +1,233 @@
+"""password stage models"""
+
+from datetime import datetime
+from typing import Any
+
+from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.postgres.fields import ArrayField
+from django.db import models, transaction
+from django.http import HttpRequest
+from django.utils.timezone import now
+from django.utils.translation import gettext_lazy as _
+from django.views import View
+from rest_framework.serializers import BaseSerializer
+
+from authentik.core.models import User
+from authentik.core.signals import password_changed, password_hash_changed
+from authentik.core.types import UserSettingSerializer
+from authentik.flows.models import ConfigurableStage, Stage
+from authentik.stages.authenticator.models import Device
+from authentik.stages.password import (
+    BACKEND_APP_PASSWORD,
+    BACKEND_INBUILT,
+    BACKEND_KERBEROS,
+    BACKEND_LDAP,
+)
+
+
+def get_authentication_backends():
+    """Return all available authentication backends as tuple set"""
+    return [
+        (
+            BACKEND_INBUILT,
+            _("User database + standard password"),
+        ),
+        (
+            BACKEND_APP_PASSWORD,
+            _("User database + app passwords"),
+        ),
+        (
+            BACKEND_LDAP,
+            _("User database + LDAP password"),
+        ),
+        (
+            BACKEND_KERBEROS,
+            _("User database + Kerberos password"),
+        ),
+    ]
+
+
+class PasswordStage(ConfigurableStage, Stage):
+    """Prompt the user for their password, and validate it against the configured backends."""
+
+    backends = ArrayField(
+        models.TextField(choices=get_authentication_backends()),
+        help_text=_("Selection of backends to test the password against."),
+    )
+    failed_attempts_before_cancel = models.IntegerField(
+        default=5,
+        help_text=_(
+            "How many attempts a user has before the flow is canceled. "
+            "This only cancels the flow, it does not lock the user's password."
+        ),
+    )
+    failed_attempts_before_lockout = models.PositiveIntegerField(
+        default=0,
+        help_text=_(
+            "How many consecutive failed attempts lock the user's password until an "
+            "administrator unlocks it. Set to 0 to never lock."
+        ),
+    )
+    last_attempt_warning_message = models.TextField(
+        blank=True,
+        default="",
+        help_text=_(
+            "Warning shown when the user has one password attempt remaining. "
+            "Leave blank to show no warning."
+        ),
+    )
+    lockout_message = models.TextField(
+        blank=True,
+        default="",
+        help_text=_(
+            "Message shown when the user's password has been locked. "
+            "Leave blank to show a generic authentication error."
+        ),
+    )
+    allow_show_password = models.BooleanField(
+        default=False,
+        help_text=_(
+            "When enabled, provides a 'show password' button with the password input field."
+        ),
+    )
+
+    @property
+    def serializer(self) -> type[BaseSerializer]:
+        from authentik.stages.password.api import PasswordStageSerializer
+
+        return PasswordStageSerializer
+
+    @property
+    def view(self) -> type[View]:
+        from authentik.stages.password.stage import PasswordStageView
+
+        return PasswordStageView
+
+    @property
+    def component(self) -> str:
+        return "ak-stage-password-form"
+
+    def ui_user_settings(self) -> UserSettingSerializer | None:
+        if not self.configure_flow:
+            return None
+        return UserSettingSerializer(
+            data={
+                "title": str(self._meta.verbose_name),
+                "component": "ak-user-settings-password",
+            }
+        )
+
+    class Meta:
+        verbose_name = _("Password Stage")
+        verbose_name_plural = _("Password Stages")
+
+
+class PasswordDevice(Device):
+    """A user's password, excluded from MFA discovery and validation."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="password_device")
+    password = models.CharField(max_length=128)
+    password_change_date = models.DateTimeField(default=now)
+    failed_attempts = models.PositiveIntegerField(default=0)
+    locked_at = models.DateTimeField(default=None, null=True)
+
+    @classmethod
+    def set_password(
+        cls,
+        user: User,
+        raw_password: str | None,
+        *,
+        signal: bool = True,
+        sender: Any = None,
+        request: HttpRequest | None = None,
+    ):
+        """Hash and store a password. `None` revokes the password."""
+        if signal:
+            password_changed.send(
+                sender=sender or user, user=user, password=raw_password, request=request
+            )
+        cls._store(user, make_password(raw_password))
+
+    @classmethod
+    def set_password_from_hash(
+        cls,
+        user: User,
+        password_hash: str,
+        *,
+        signal: bool = True,
+        sender: Any = None,
+        request: HttpRequest | None = None,
+        hasher_defaults_overridden: bool = False,
+    ):
+        """Store an already validated password hash as-is.
+
+        Because no raw password is available, downstream password sync integrations
+        such as LDAP and Kerberos cannot be updated from this code path."""
+        if signal:
+            password_hash_changed.send(
+                sender=sender or user,
+                user=user,
+                request=request,
+                hasher_defaults_overridden=hasher_defaults_overridden,
+            )
+        cls._store(user, password_hash)
+
+    @classmethod
+    def set_unusable_password(cls, user: User, *, password_change_date: datetime | None = None):
+        """Refuse password authentication until a new password is set.
+
+        The change date stays unless `password_change_date` gives the time the password
+        changed elsewhere, such as in a source directory.
+        A user without a password device already has no usable password."""
+        with transaction.atomic():
+            device = cls.objects.select_for_update().filter(user=user).first()
+            if device is None:
+                return
+            device.password = make_password(None)
+            update_fields = ["password", "last_updated"]
+            if password_change_date is not None:
+                device.password_change_date = password_change_date
+                update_fields.append("password_change_date")
+            device.save(update_fields=update_fields)
+            user.password_device = device
+            # Saving the user dispatches outgoing sync and invalidates cached policy results.
+            user.save(update_fields=["last_updated"])
+
+    @classmethod
+    def _store(cls, user: User, password_hash: str):
+        """Replace the password, keeping any lock on the device."""
+        defaults = {"password": password_hash, "password_change_date": now(), "failed_attempts": 0}
+        with transaction.atomic():
+            device, _ = cls.objects.update_or_create(
+                user=user, defaults=defaults, create_defaults={"name": "Password", **defaults}
+            )
+            user.password_device = device
+            # Saving the user dispatches outgoing sync and invalidates cached policy results.
+            user.save(update_fields=["last_updated"])
+
+    def check_password(self, raw_password: str) -> bool:
+        """Upgrade outdated hashes without replacing a concurrently changed password."""
+
+        def setter(raw_password):
+            password = make_password(raw_password)
+            if (
+                type(self)
+                .objects.filter(pk=self.pk, password=self.password)
+                .update(password=password)
+            ):
+                self.password = password
+
+        return check_password(raw_password, self.password, setter)
+
+    def __str__(self):
+        return str(self.name) or str(self.user_id)
+
+    class Meta(Device.Meta):
+        verbose_name = _("Password Device")
+        verbose_name_plural = _("Password Devices")
+        indexes = [models.Index(fields=["password_change_date"])]
+
+    @property
+    def locked(self) -> bool:
+        """Whether this password currently refuses authentication."""
+        return self.locked_at is not None

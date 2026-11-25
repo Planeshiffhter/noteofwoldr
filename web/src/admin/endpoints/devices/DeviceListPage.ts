@@ -1,0 +1,205 @@
+import "#elements/cards/AggregateCard";
+import "#elements/forms/DeleteBulkForm";
+import "#admin/endpoints/devices/DeviceAddHowTo";
+import PFBanner from "@patternfly/patternfly/components/Banner/banner.css";
+import PFGrid from "@patternfly/patternfly/layouts/Grid/grid.css";
+
+import { aki } from "#common/api/client";
+
+import { ModalInvokerButton, modalInvoker } from "#elements/dialogs";
+import { toAdminInterface } from "#elements/router/core/interfaces";
+import { PaginatedResponse, TableColumn, Timestamp } from "#elements/table/Table";
+import { TablePage } from "#elements/table/TablePage";
+import { SlottedTemplateResult } from "#elements/types";
+
+import { EndpointDeviceForm } from "#admin/endpoints/devices/DeviceForm";
+import { getPolicyUserGroupRow } from "#admin/policies/BoundPoliciesList";
+
+import { DeviceSummary, EndpointDevice, EndpointsApi } from "@goauthentik/api";
+
+import { msg, str } from "@lit/localize";
+import { css, CSSResult, html, nothing, TemplateResult } from "lit";
+import { customElement, state } from "lit/decorators.js";
+
+@customElement("ak-endpoints-device-list")
+export class DeviceListPage extends TablePage<EndpointDevice> {
+    public static override verboseName = msg("Endpoint Device", {
+        id: "endpoint-devices.verbose-name.label",
+    });
+    public static override verboseNamePlural = msg("Endpoint Devices", {
+        id: "endpoint-devices.verbose-name-plural.label",
+    });
+
+    public static styles: CSSResult[] = [
+        ...super.styles,
+        PFGrid,
+        PFBanner,
+        css`
+            .pf-m-no-padding-bottom {
+                padding-bottom: 0;
+            }
+        `,
+    ];
+    public override pageTitle = msg("Devices");
+    public override pageDescription = "";
+    public override pageIcon = "fa fa-laptop";
+
+    public override checkbox = true;
+
+    public override searchPlaceholder = msg("Search devices by name, OS, or group...");
+
+    protected searchEnabled: boolean = true;
+    protected columns: TableColumn[] = [
+        [msg("Name"), "name"],
+        [msg("OS")],
+        [msg("Primary user")],
+        [msg("Group")],
+        [msg("Last updated")],
+        [msg("Actions"), null, msg("Row Actions")],
+    ];
+
+    ordering = "name";
+
+    @state()
+    summary?: DeviceSummary;
+
+    async apiEndpoint(): Promise<PaginatedResponse<EndpointDevice>> {
+        this.summary = await aki(EndpointsApi).endpointsDevicesSummaryRetrieve();
+
+        return aki(EndpointsApi).endpointsDevicesList(await this.defaultEndpointConfig());
+    }
+
+    protected renderEmpty(inner?: TemplateResult): SlottedTemplateResult {
+        return super.renderEmpty(html`
+            ${
+                inner
+                    ? inner
+                    : html`<ak-empty-state icon=${this.pageIcon}
+                          ><span>${this.formatEmptyStateMessage()}</span>
+                          <div slot="body">
+                              ${this.search ? this.renderEmptyClearSearch() : nothing}
+                              <p>
+                                  ${msg(
+                                      "No connectors configured. Navigate to Connectors in the sidebar and first create a connector.",
+                                  )}
+                              </p>
+                          </div>
+                      </ak-empty-state>`
+            }
+        `);
+    }
+
+    renderSectionBefore() {
+        return html`
+            <div class="pf-c-banner pf-m-info">
+                ${msg("Endpoint Devices are in preview.")}
+                <a href="mailto:hello+feature/platform@goauthentik.io"
+                    >${msg("Send us feedback!")}</a
+                >
+            </div>
+            <section class="pf-c-page__main-section pf-m-no-padding-bottom">
+                <div
+                    class="pf-l-grid pf-m-gutter pf-m-all-6-col-on-sm pf-m-all-4-col-on-md pf-m-all-4-col-on-lg pf-m-all-4-col-on-xl"
+                >
+                    <ak-aggregate-card
+                        role="status"
+                        class="pf-l-grid__item"
+                        icon="fa fa-laptop"
+                        label=${msg("Total devices")}
+                        subtext=${msg("Total count of devices across all groups")}
+                    >
+                        ${this.summary?.totalCount ?? "-"}
+                    </ak-aggregate-card>
+                    <ak-aggregate-card
+                        role="status"
+                        class="pf-l-grid__item"
+                        icon="fa fa-laptop"
+                        label=${msg("Unreachable devices")}
+                        subtext=${msg(
+                            "Devices that authentik hasn't received information about in 24h.",
+                        )}
+                    >
+                        ${this.summary?.unreachableCount ?? "-"}
+                    </ak-aggregate-card>
+                    <ak-aggregate-card
+                        role="status"
+                        class="pf-l-grid__item"
+                        icon="fa fa-laptop"
+                        label=${msg("Outdated agents")}
+                        subtext=${msg("Devices running an outdated version of an agent")}
+                    >
+                        ${this.summary?.outdatedAgentCount ?? "-"}
+                    </ak-aggregate-card>
+                </div>
+            </section>
+        `;
+    }
+
+    renderName(item: EndpointDevice) {
+        if (item.facts?.data.network?.hostname && item.facts.data.network.hostname !== item.name) {
+            return msg(str`${item.facts.data.network.hostname} (${item.name})`);
+        }
+
+        return item.name;
+    }
+
+    row(item: EndpointDevice): SlottedTemplateResult[] {
+        return [
+            html`<a href=${toAdminInterface(`endpoints/devices/${item.deviceUuid}`)}>
+                <div>${this.renderName(item)}</div>
+                ${
+                    item.facts?.data.hardware?.serial
+                        ? html`<small>${item.facts?.data.hardware?.serial}</small>`
+                        : nothing
+                }
+            </a>`,
+            html`${item.facts?.data.os ? html`${item.facts?.data.os?.name} ${item.facts?.data.os?.version}` : html`-`}`,
+            item.primaryBindingObj ? getPolicyUserGroupRow(item.primaryBindingObj) : html`-`,
+            html`${item.accessGroupObj?.name || "-"}`,
+            item.facts?.created ? Timestamp(item.facts?.created) : html`-`,
+            html`<button
+                class="pf-c-button pf-m-plain"
+                ${modalInvoker(EndpointDeviceForm, { instancePk: item.deviceUuid })}
+            >
+                <pf-tooltip position="top" content=${msg("Edit")}>
+                    <i class="fas fa-edit" aria-hidden="true"></i>
+                </pf-tooltip>
+            </button>`,
+        ];
+    }
+
+    protected override renderObjectCreate(): SlottedTemplateResult {
+        return ModalInvokerButton(EndpointDeviceForm);
+    }
+
+    renderToolbarSelected() {
+        const disabled = this.selectedElements.length < 1;
+
+        return html`<ak-forms-delete-bulk
+            .objects=${this.selectedElements}
+            .metadata=${(item: EndpointDevice) => {
+                return [{ key: msg("Name"), value: item.name }];
+            }}
+            .usedBy=${(item: EndpointDevice) => {
+                return aki(EndpointsApi).endpointsDevicesUsedByList({
+                    deviceUuid: item.deviceUuid!,
+                });
+            }}
+            .delete=${(item: EndpointDevice) => {
+                return aki(EndpointsApi).endpointsDevicesDestroy({
+                    deviceUuid: item.deviceUuid!,
+                });
+            }}
+        >
+            <button ?disabled=${disabled} slot="trigger" class="pf-c-button pf-m-danger">
+                ${msg("Delete")}
+            </button>
+        </ak-forms-delete-bulk>`;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-endpoints-device-list": DeviceListPage;
+    }
+}

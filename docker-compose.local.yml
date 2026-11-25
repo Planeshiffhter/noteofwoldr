@@ -1,0 +1,65 @@
+x-authentik: &authentik
+  image: noteofwoldr-authentik:local
+  pull_policy: never
+  restart: unless-stopped
+  shm_size: 512mb
+  depends_on:
+    postgresql:
+      condition: service_healthy
+  env_file:
+    - .env
+  environment:
+    AUTHENTIK_POSTGRESQL__HOST: ${AUTHENTIK_POSTGRESQL__HOST:-postgresql}
+    AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+    AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:?database password required}
+    AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+    AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?secret key required}
+    AUTHENTIK_ERROR_REPORTING__ENABLED: ${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
+    AUTHENTIK_DISABLE_STARTUP_ANALYTICS: ${AUTHENTIK_DISABLE_STARTUP_ANALYTICS:-true}
+    AUTHENTIK_DISABLE_UPDATE_CHECK: ${AUTHENTIK_DISABLE_UPDATE_CHECK:-true}
+
+services:
+  postgresql:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:?database password required}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+    healthcheck:
+      test:
+        [CMD-SHELL, 'pg_isready -d "$${POSTGRES_DB}" -U "$${POSTGRES_USER}"']
+      interval: 30s
+      retries: 5
+      start_period: 20s
+      timeout: 5s
+    volumes:
+      - database:/var/lib/postgresql/data
+  server:
+    <<: *authentik
+    build:
+      context: .
+      dockerfile: lifecycle/container/Dockerfile
+      args:
+        GIT_BUILD_HASH: dev
+    command: server
+    ports:
+      - "${COMPOSE_PORT_HTTP:-9000}:9000"
+      - "${COMPOSE_PORT_HTTPS:-9443}:9443"
+    volumes:
+      - data:/data
+      - media:/media
+      - ./custom-templates:/templates:ro
+  worker:
+    <<: *authentik
+    command: worker
+    volumes:
+      - data:/data
+      - media:/media
+      - ./certs:/certs:ro
+      - ./custom-templates:/templates:ro
+
+volumes:
+  database:
+  data:
+  media:

@@ -1,0 +1,164 @@
+"""SAML Identity Provider Metadata Processor"""
+
+from collections.abc import Iterator
+from hashlib import sha256
+
+import xmlsec  # nosec
+from django.http import HttpRequest
+from django.urls import reverse
+from lxml.etree import Element, SubElement, _Element, tostring  # nosec
+
+from authentik.common.saml.constants import (
+    NS_MAP,
+    NS_SAML_METADATA,
+    NS_SAML_PROTOCOL,
+    NS_SIGNATURE,
+    SAML_BINDINGS_SUPPORTED,
+    SAML_NAME_ID_FORMAT_EMAIL,
+    SAML_NAME_ID_FORMAT_PERSISTENT,
+    SAML_NAME_ID_FORMAT_TRANSIENT,
+    SAML_NAME_ID_FORMAT_X509,
+    SIGN_ALGORITHM_TRANSFORM_MAP,
+)
+from authentik.common.saml.utils import x509_certificate_b64
+from authentik.providers.saml.models import SAMLProvider
+from authentik.providers.saml.processors.signature import sign_xml_element
+
+
+class MetadataProcessor:
+    """SAML Identity Provider Metadata Processor"""
+
+    provider: SAMLProvider
+    http_request: HttpRequest
+    force_binding: str | None
+
+    def __init__(self, provider: SAMLProvider, request: HttpRequest):
+        self.provider = provider
+        self.http_request = request
+        self.force_binding = None
+        self.xml_id = "_" + sha256(f"{provider.name}-{provider.pk}".encode("ascii")).hexdigest()
+
+    def _get_issuer_value(self) -> str:
+        """Get issuer value, with fallback to generated URL if empty"""
+        # If user has set an override issuer, use it
+        if self.provider.issuer_override:
+            return self.provider.issuer_override
+
+        return self.http_request.build_absolute_uri(
+            reverse(
+                "authentik_providers_saml:metadata-download",
+                kwargs={"application_slug": self.provider.application.slug},
+            )
+        )
+
+    # Using type unions doesn't work with cython types (which is what lxml is)
+    def get_signing_key_descriptor(self) -> Element | None:
+        """Get Signing KeyDescriptor, if enabled for the provider"""
+        if not self.provider.signing_kp:
+            return None
+        key_descriptor = Element(f"{{{NS_SAML_METADATA}}}KeyDescriptor")
+        key_descriptor.attrib["use"] = "signing"
+        key_info = SubElement(key_descriptor, f"{{{NS_SIGNATURE}}}KeyInfo")
+        x509_data = SubElement(key_info, f"{{{NS_SIGNATURE}}}X509Data")
+        x509_certificate = SubElement(x509_data, f"{{{NS_SIGNATURE}}}X509Certificate")
+        x509_certificate.text = x509_certificate_b64(self.provider.signing_kp.certificate)
+        return key_descriptor
+
+    def get_name_id_formats(self) -> Iterator[Element]:
+        """Get compatible NameID Formats"""
+        formats = [
+            SAML_NAME_ID_FORMAT_EMAIL,
+            SAML_NAME_ID_FORMAT_PERSISTENT,
+            SAML_NAME_ID_FORMAT_X509,
+            SAML_NAME_ID_FORMAT_TRANSIENT,
+        ]
+        for name_id_format in formats:
+            element = Element(f"{{{NS_SAML_METADATA}}}NameIDFormat")
+            element.text = name_id_format
+            yield element
+
+    def _get_unified_url(self) -> str:
+        """Get the unified SAML endpoint URL"""
+        return self.http_request.build_absolute_uri(
+            reverse(
+                "authentik_providers_saml:base",
+                kwargs={"application_slug": self.provider.application.slug},
+            )
+        )
+
+    def get_sso_bindings(self) -> Iterator[Element]:
+        """Get all SSO Bindings - both point to unified endpoint"""
+        unified_url = self._get_unified_url()
+        for binding in SAML_BINDINGS_SUPPORTED:
+            if self.force_binding and self.force_binding != binding:
+                continue
+            element = Element(f"{{{NS_SAML_METADATA}}}SingleSignOnService")
+            element.attrib["Binding"] = binding
+            element.attrib["Location"] = unified_url
+            yield element
+
+    def get_slo_bindings(self) -> Iterator[Element]:
+        """Get all SLO Bindings - both point to unified endpoint"""
+        unified_url = self._get_unified_url()
+        for binding in SAML_BINDINGS_SUPPORTED:
+            if self.force_binding and self.force_binding != binding:
+                continue
+            element = Element(f"{{{NS_SAML_METADATA}}}SingleLogoutService")
+            element.attrib["Binding"] = binding
+            element.attrib["Location"] = unified_url
+            yield element
+
+    def _prepare_signature(self, entity_descriptor: _Element):
+        sign_algorithm_transform = SIGN_ALGORITHM_TRANSFORM_MAP.get(
+            self.provider.signature_algorithm, xmlsec.constants.TransformRsaSha1
+        )
+        signature = xmlsec.template.create(
+            entity_descriptor,
+            xmlsec.constants.TransformExclC14N,
+            sign_algorithm_transform,
+            ns=xmlsec.constants.DSigNs,
+        )
+        entity_descriptor.append(signature)
+
+    def _sign(self, entity_descriptor: _Element) -> None:
+        sign_xml_element(entity_descriptor, self.provider)
+
+    def add_children(self, entity_descriptor: _Element):
+        self.add_idp_sso(entity_descriptor)
+
+    def add_idp_sso(self, entity_descriptor: _Element):
+        idp_sso_descriptor = SubElement(
+            entity_descriptor, f"{{{NS_SAML_METADATA}}}IDPSSODescriptor"
+        )
+        idp_sso_descriptor.attrib["protocolSupportEnumeration"] = NS_SAML_PROTOCOL
+        if self.provider.verification_kp:
+            idp_sso_descriptor.attrib["WantAuthnRequestsSigned"] = "true"
+
+        signing_descriptor = self.get_signing_key_descriptor()
+        if signing_descriptor is not None:
+            idp_sso_descriptor.append(signing_descriptor)
+
+        for binding in self.get_slo_bindings():
+            idp_sso_descriptor.append(binding)
+
+        for name_id_format in self.get_name_id_formats():
+            idp_sso_descriptor.append(name_id_format)
+
+        for binding in self.get_sso_bindings():
+            idp_sso_descriptor.append(binding)
+
+    def build_entity_descriptor(self) -> str:
+        """Build full EntityDescriptor"""
+        entity_descriptor = Element(f"{{{NS_SAML_METADATA}}}EntityDescriptor", nsmap=NS_MAP)
+        entity_descriptor.attrib["ID"] = self.xml_id
+        entity_descriptor.attrib["entityID"] = self._get_issuer_value()
+
+        if self.provider.signing_kp:
+            self._prepare_signature(entity_descriptor)
+
+        self.add_children(entity_descriptor)
+
+        if self.provider.signing_kp:
+            self._sign(entity_descriptor)
+
+        return tostring(entity_descriptor).decode()

@@ -1,0 +1,152 @@
+import PFAlert from "@patternfly/patternfly/components/Alert/alert.css";
+import PFAlertGroup from "@patternfly/patternfly/components/AlertGroup/alert-group.css";
+import PFButton from "@patternfly/patternfly/components/Button/button.css";
+
+import { MessageLevel } from "#common/messages";
+
+import { AKElement } from "#elements/Base";
+
+import { msg } from "@lit/localize";
+import { CSSResult, html, nothing, PropertyValues, TemplateResult } from "lit";
+import { customElement, property } from "lit/decorators.js";
+import { classMap } from "lit/directives/class-map.js";
+import { ifDefined } from "lit/directives/if-defined.js";
+
+const LevelIconMap = {
+    [MessageLevel.error]: "fas fa-exclamation-circle",
+    [MessageLevel.warning]: "fas fa-exclamation-triangle",
+    [MessageLevel.success]: "fas fa-check-circle",
+    [MessageLevel.info]: "fas fa-info-circle",
+} as const satisfies Record<MessageLevel, string>;
+
+const LevelARIALiveMap = {
+    [MessageLevel.error]: "assertive",
+    [MessageLevel.warning]: "assertive",
+    [MessageLevel.success]: "polite",
+    [MessageLevel.info]: "polite",
+} as const satisfies Record<MessageLevel, string>;
+
+@customElement("ak-message")
+export class Message extends AKElement {
+    static styles: CSSResult[] = [PFButton, PFAlert, PFAlertGroup];
+
+    //#region Properties
+
+    @property({ type: String, attribute: false })
+    public description?: string | TemplateResult;
+
+    @property({ type: String })
+    public level?: MessageLevel;
+
+    @property({ type: String })
+    public icon?: string;
+
+    @property({ attribute: false })
+    public onDismiss?: () => void;
+
+    @property({ type: Boolean })
+    public live?: boolean;
+
+    @property({ type: Number })
+    public lifetime?: number = 8000;
+
+    //#endregion
+
+    //#region Lifecycle
+
+    #timeoutID = -1;
+
+    // Track when the message is shown, so we know when to dismiss it.
+    #shownAt = 0;
+
+    #scheduleDismiss = () => {
+        clearTimeout(this.#timeoutID);
+        this.#timeoutID = -1;
+
+        if (typeof this.lifetime !== "number" || !isFinite(this.lifetime)) {
+            return;
+        }
+
+        if (!this.onDismiss) return;
+
+        // Calculate how much time is *left* before we need to schedule the dismissal.
+        const remaining = Math.max(0, this.#shownAt + this.lifetime - Date.now());
+
+        this.#timeoutID = setTimeout(() => this.onDismiss?.(), remaining);
+    };
+
+    public firstUpdated() {
+        this.#shownAt = Date.now();
+    }
+
+    public updated(changed: PropertyValues<this>) {
+        if (changed.has("lifetime") || changed.has("onDismiss")) {
+            this.#scheduleDismiss();
+        }
+    }
+
+    public connectedCallback() {
+        super.connectedCallback();
+
+        if (this.hasUpdated) this.#scheduleDismiss();
+    }
+
+    public disconnectedCallback() {
+        super.disconnectedCallback();
+        clearTimeout(this.#timeoutID);
+    }
+
+    //#endregion
+
+    public render() {
+        const { description, level = MessageLevel.info, icon = LevelIconMap[level] } = this;
+        const ariaLive = this.live ? LevelARIALiveMap[level] : "off";
+
+        return html`<li
+            role="status"
+            aria-live="${ariaLive}"
+            aria-atomic="true"
+            aria-labelledby="message-title"
+            aria-describedby=${ifDefined(description ? "message-description" : undefined)}
+            class="pf-c-alert-group__item"
+        >
+            <div
+                class="${classMap({
+                    "pf-c-alert": true,
+                    [`pf-m-${level}`]: true,
+                    "pf-m-danger": level === MessageLevel.error,
+                })}"
+            >
+                <div class="pf-c-alert__icon">
+                    <i class="${icon}" aria-hidden="true"></i>
+                </div>
+                <p class="pf-c-alert__title" id="message-title">
+                    <slot></slot>
+                </p>
+                ${
+                    description
+                        ? html`<div class="pf-c-alert__description" id="message-description">
+                              <p>${description}</p>
+                          </div>`
+                        : nothing
+                }
+                <div class="pf-c-alert__action">
+                    <button
+                        aria-label=${msg("Dismiss")}
+                        class="pf-c-button pf-m-plain"
+                        type="button"
+                        @click=${this.onDismiss}
+                    >
+                        <i class="fas fa-times" aria-hidden="true"></i>
+                    </button>
+                </div>
+            </div>
+        </li>`;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-message": Message;
+    }
+}

@@ -1,0 +1,56 @@
+"""FreeIPA specific"""
+
+from collections.abc import Generator
+from datetime import UTC, datetime
+from typing import Any
+
+from authentik.core.models import User
+from authentik.sources.ldap.models import flatten
+from authentik.sources.ldap.sync.base import BaseLDAPSynchronizer
+from authentik.stages.password.models import PasswordDevice
+
+
+class FreeIPA(BaseLDAPSynchronizer):
+    """FreeIPA-specific LDAP"""
+
+    @staticmethod
+    def name() -> str:
+        return "freeipa"
+
+    def get_objects(self, **kwargs) -> Generator:
+        yield None
+
+    def sync(self, attributes: dict[str, Any], user: User, created: bool):
+        self.check_pwd_last_set(attributes, user, created)
+
+    def check_pwd_last_set(self, attributes: dict[str, Any], user: User, created: bool):
+        """Check krbLastPwdChange"""
+        if "krbLastPwdChange" not in attributes:
+            return
+        pwd_last_set: datetime = flatten(attributes.get("krbLastPwdChange", datetime.now()))
+        pwd_last_set = pwd_last_set.replace(tzinfo=UTC)
+        if created or pwd_last_set > user.password_change_date:
+            self._task.info(f"'{user.username}': Reset user's password")
+            self._logger.debug(
+                "Reset user's password",
+                user=user.username,
+                created=created,
+                pwd_last_set=pwd_last_set,
+            )
+            # Record the directory's change date, or every later sync resets the password
+            # again, and each new unusable hash ends the user's sessions.
+            PasswordDevice.set_unusable_password(user, password_change_date=pwd_last_set)
+
+    def get_account_active(self, attributes: dict[str, Any]) -> bool | None:
+        """https://www.port389.org/docs/389ds/howto/howto-account-inactivation.html"""
+        # This is more of a 389-ds quirk rather than FreeIPA, but FreeIPA uses
+        # 389-ds and this will trigger regardless
+        if "nsaccountlock" not in attributes:
+            return
+        # For some reason, nsaccountlock is not defined properly in the schema as bool
+        # hence we get it as a list of strings
+        _is_locked = str(flatten(attributes.get("nsaccountlock", ["FALSE"])))
+        # So we have to attempt to convert it to a bool
+        is_locked = _is_locked.lower() == "true"
+        # And then invert it since freeipa saves locked and we save active
+        return not is_locked

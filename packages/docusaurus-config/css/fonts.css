@@ -1,0 +1,16 @@
+:root {
+    /* We prefer system fonts for the base to ensure the user's preference is respected. */
+    --ifm-font-family-base:
+        system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif,
+        BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji",
+        "Segoe UI Emoji", "Segoe UI Symbol";
+
+    --ifm-font-family-monospace:
+        RedHatMono, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+        monospace;
+
+    --ifm-heading-font-family: RedHatDisplay, var(--ifm-font-family-base);
+
+    --ifm-h5-font-size: 0.88rem;
+    --ifm-code-font-size: 100%;
+}

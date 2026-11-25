@@ -1,0 +1,253 @@
+import "#components/ak-radio-input";
+import "#components/ak-secret-text-input";
+import "#components/ak-number-input";
+import "#components/ak-switch-input";
+import "#elements/utils/TimeDeltaHelp";
+import "#components/ak-text-input";
+import "#elements/ak-dual-select/ak-dual-select-dynamic-selected-provider";
+import "#elements/ak-dual-select/ak-dual-select-provider";
+import "#elements/forms/FormGroup";
+import "#elements/forms/HorizontalFormElement";
+import "#elements/forms/Radio";
+import { aki } from "#common/api/client";
+
+import { AKSearchSelect } from "#components/ak-search-select-field";
+
+import { groupSource } from "#admin/common/search-sources";
+import { BaseProviderForm } from "#admin/providers/BaseProviderForm";
+import {
+    propertyMappingsProvider,
+    propertyMappingsSelector,
+} from "#admin/providers/microsoft_entra/MicrosoftEntraProviderFormHelpers";
+
+import {
+    MicrosoftEntraProvider,
+    MicrosoftEntraProviderRequest,
+    OutgoingSyncDeleteAction,
+    ProvidersApi,
+} from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { html, TemplateResult } from "lit";
+import { customElement } from "lit/decorators.js";
+import { ifDefined } from "lit/directives/if-defined.js";
+
+@customElement("ak-provider-microsoft-entra-form")
+export class MicrosoftEntraProviderFormPage extends BaseProviderForm<MicrosoftEntraProvider> {
+    protected endpoints = {
+        load: (id: number) => aki(ProvidersApi).providersMicrosoftEntraRetrieve({ id }),
+        create: (microsoftEntraProviderRequest: MicrosoftEntraProvider) =>
+            aki(ProvidersApi).providersMicrosoftEntraCreate({
+                microsoftEntraProviderRequest:
+                    microsoftEntraProviderRequest as unknown as MicrosoftEntraProviderRequest,
+            }),
+        update: (id: number, patchedMicrosoftEntraProviderRequest: MicrosoftEntraProvider) =>
+            aki(ProvidersApi).providersMicrosoftEntraPartialUpdate({
+                id,
+                patchedMicrosoftEntraProviderRequest,
+            }),
+    };
+
+    protected override renderForm(): TemplateResult {
+        return html` <ak-form-element-horizontal label=${msg("Provider Name")} required name="name">
+                <input
+                    type="text"
+                    value="${ifDefined(this.instance?.name)}"
+                    class="pf-c-form-control"
+                    placeholder=${msg("Type a provider name...")}
+                    spellcheck="false"
+                    required
+                />
+            </ak-form-element-horizontal>
+            <ak-form-group open label="${msg("Protocol settings")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal label=${msg("Client ID")} required name="clientId">
+                        <input
+                            type="text"
+                            value="${this.instance?.clientId ?? ""}"
+                            class="pf-c-form-control pf-m-monospace"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Client ID for the app registration.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-secret-text-input
+                        name="clientSecret"
+                        label=${msg("Client Secret")}
+                        input-hint="code"
+                        ?required=${!this.instance}
+                        ?revealed=${!this.instance}
+                        .help=${msg("Client secret for the app registration.")}
+                    >
+                    </ak-secret-text-input>
+                    <ak-form-element-horizontal label=${msg("Tenant ID")} required name="tenantId">
+                        <input
+                            type="text"
+                            value="${this.instance?.tenantId ?? ""}"
+                            class="pf-c-form-control pf-m-monospace"
+                            required
+                        />
+                        <p class="pf-c-form__helper-text">
+                            ${msg("ID of the tenant accounts will be synced into.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-radio-input
+                        name="userDeleteAction"
+                        label=${msg("User deletion action")}
+                        required
+                        .options=${[
+                            {
+                                label: msg("Delete"),
+                                value: OutgoingSyncDeleteAction.Delete,
+                                default: true,
+                                description: html`${msg("User is deleted")}`,
+                            },
+                            {
+                                label: msg("Suspend", { id: "common.actions.suspend.label" }),
+                                value: OutgoingSyncDeleteAction.Suspend,
+                                description: html`${msg(
+                                    "User is suspended, and connection to user in authentik is removed.",
+                                    { id: "providers.user-deletion.suspend.description" },
+                                )}`,
+                            },
+                            {
+                                label: msg("Do Nothing"),
+                                value: OutgoingSyncDeleteAction.DoNothing,
+                                description: html`${msg(
+                                    "The connection is removed but the user is not modified",
+                                )}`,
+                            },
+                        ]}
+                        .value=${this.instance?.userDeleteAction}
+                        help=${msg("Determines what authentik will do when a User is deleted.")}
+                    >
+                    </ak-radio-input>
+                    <ak-radio-input
+                        name="groupDeleteAction"
+                        label=${msg("Group deletion action")}
+                        required
+                        .options=${[
+                            {
+                                label: msg("Delete"),
+                                value: OutgoingSyncDeleteAction.Delete,
+                                default: true,
+                                description: html`${msg("Group is deleted")}`,
+                            },
+                            {
+                                label: msg("Do Nothing"),
+                                value: OutgoingSyncDeleteAction.DoNothing,
+                                description: html`${msg(
+                                    "The connection is removed but the group is not modified",
+                                )}`,
+                            },
+                        ]}
+                        .value=${this.instance?.groupDeleteAction}
+                        help=${msg("Determines what authentik will do when a Group is deleted.")}
+                    >
+                    </ak-radio-input>
+                    <ak-switch-input
+                        name="dryRun"
+                        label=${msg("Enable dry-run mode")}
+                        ?checked=${this.instance?.dryRun ?? false}
+                        help=${msg(
+                            "When enabled, mutating requests will be dropped and logged instead.",
+                        )}
+                    ></ak-switch-input>
+                </div>
+            </ak-form-group>
+            <ak-form-group open label="${msg("User filtering")}">
+                <div class="pf-c-form">
+                    <ak-switch-input
+                        name="excludeUsersServiceAccount"
+                        label=${msg("Exclude service accounts")}
+                        ?checked=${this.instance?.excludeUsersServiceAccount ?? true}
+                    ></ak-switch-input>
+                    <ak-form-element-horizontal label=${msg("Group")} name="filterGroup">
+                        ${AKSearchSelect({
+                            name: "filterGroup",
+                            source: groupSource,
+                            value: this.instance?.filterGroup,
+                            blankable: true,
+                        })}
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Only sync users within the selected group.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                </div>
+            </ak-form-group>
+            <ak-form-group open label="${msg("Attribute mapping")}">
+                <div class="pf-c-form">
+                    <ak-form-element-horizontal
+                        label=${msg("User Property Mappings")}
+                        name="propertyMappings"
+                    >
+                        <ak-dual-select-dynamic-selected
+                            .provider=${propertyMappingsProvider}
+                            .selector=${propertyMappingsSelector(
+                                this.instance?.propertyMappings,
+                                "goauthentik.io/providers/microsoft_entra/user",
+                            )}
+                            available-label=${msg("Available Property Mappings")}
+                            selected-label=${msg("Selected Property Mappings")}
+                        ></ak-dual-select-dynamic-selected>
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Property mappings used to user mapping.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                    <ak-form-element-horizontal
+                        label=${msg("Group Property Mappings")}
+                        name="propertyMappingsGroup"
+                    >
+                        <ak-dual-select-dynamic-selected
+                            .provider=${propertyMappingsProvider}
+                            .selector=${propertyMappingsSelector(
+                                this.instance?.propertyMappingsGroup,
+                                "goauthentik.io/providers/microsoft_entra/group",
+                            )}
+                            available-label=${msg("Available Property Mappings")}
+                            selected-label=${msg("Selected Property Mappings")}
+                        ></ak-dual-select-dynamic-selected>
+                        <p class="pf-c-form__helper-text">
+                            ${msg("Property mappings used to group creation.")}
+                        </p>
+                    </ak-form-element-horizontal>
+                </div>
+            </ak-form-group>
+            <ak-form-group label="${msg("Sync settings")}">
+                <div class="pf-c-form">
+                    <ak-number-input
+                        label=${msg("Page size")}
+                        required
+                        name="pageSize"
+                        value="${this.instance?.syncPageSize ?? 100}"
+                        help=${msg("Controls the number of objects synced in a single task.")}
+                    ></ak-number-input>
+                    <ak-text-input
+                        name="syncPageTimeout"
+                        label=${msg("Page timeout")}
+                        input-hint="code"
+                        required
+                        value="${ifDefined(this.instance?.syncPageTimeout ?? "minutes=30")}"
+                        .bighelp=${html`<p class="pf-c-form__helper-text">
+                                ${msg("Timeout for synchronization of a single page.")}
+                            </p>
+                            <ak-utils-time-delta-help></ak-utils-time-delta-help>`}
+                    >
+                    </ak-text-input>
+                    <ak-switch-input
+                        name="discoveryEnabled"
+                        label=${msg("Enable automatic discovery of remote resources.")}
+                        ?checked=${this.instance?.discoveryEnabled ?? true}
+                    >
+                    </ak-switch-input>
+                </div>
+            </ak-form-group>`;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-provider-microsoft-entra-form": MicrosoftEntraProviderFormPage;
+    }
+}

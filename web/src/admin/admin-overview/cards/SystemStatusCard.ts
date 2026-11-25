@@ -1,0 +1,82 @@
+import { aki } from "#common/api/client";
+
+import { toAdminInterface } from "#elements/router/core/interfaces";
+import { SlottedTemplateResult } from "#elements/types";
+
+import { AdminStatus, AdminStatusCard } from "#admin/admin-overview/cards/AdminStatusCard";
+
+import { AdminApi, SystemInfo } from "@goauthentik/api";
+
+import { msg } from "@lit/localize";
+import { html, nothing } from "lit";
+import { customElement, state } from "lit/decorators.js";
+
+@customElement("ak-admin-status-system")
+export class SystemStatusCard extends AdminStatusCard<SystemInfo> {
+    now?: Date;
+
+    public override icon = "pf-icon pf-icon-server";
+    public override label = msg("System Status");
+
+    @state()
+    statusSummary?: string;
+
+    async getPrimaryValue(): Promise<SystemInfo> {
+        this.now = new Date();
+
+        return await aki(AdminApi).adminSystemRetrieve();
+    }
+
+    getStatus(value: SystemInfo): Promise<AdminStatus> {
+        if (!value.embeddedOutpostDisabled && value.embeddedOutpostHost === "") {
+            this.statusSummary = msg("Warning");
+
+            return Promise.resolve<AdminStatus>({
+                icon: "fa fa-exclamation-triangle pf-m-warning",
+                message: html`${msg("Embedded outpost is not configured correctly.")}
+                    <a href=${toAdminInterface("outpost/outposts")}>${msg("Check outposts.")}</a>`,
+                tone: "warning",
+            });
+        }
+
+        if (!value.httpIsSecure && document.location.protocol === "https:") {
+            this.statusSummary = msg("Warning");
+
+            return Promise.resolve<AdminStatus>({
+                icon: "fa fa-exclamation-triangle pf-m-warning",
+                message: html`${msg("HTTPS is not detected correctly")}`,
+                tone: "warning",
+            });
+        }
+
+        const timeDiff = value.serverTime.getTime() - (this.now || new Date()).getTime();
+
+        if (timeDiff > 5000 || timeDiff < -5000) {
+            this.statusSummary = msg("Warning");
+
+            return Promise.resolve<AdminStatus>({
+                icon: "fa fa-exclamation-triangle pf-m-warning",
+                message: html`${msg("Server and client are further than 5 seconds apart.")}`,
+                tone: "warning",
+            });
+        }
+
+        this.statusSummary = msg("OK");
+
+        return Promise.resolve<AdminStatus>({
+            icon: "fa fa-check-circle pf-m-success",
+            message: html`${msg("Everything is ok.")}`,
+            tone: "success",
+        });
+    }
+
+    renderValue(): SlottedTemplateResult {
+        return this.statusSummary ? html`${this.statusSummary}` : nothing;
+    }
+}
+
+declare global {
+    interface HTMLElementTagNameMap {
+        "ak-admin-status-system": SystemStatusCard;
+    }
+}
